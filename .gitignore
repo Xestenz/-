@@ -1,0 +1,20 @@
+# Секреты — никогда не коммитить
+.env
+
+# Рантайм-состояние (реальные данные путевых, накапливается на конкретной машине)
+waybills_state.json
+field_position_overrides.json
+
+# Загруженные сканы / тестовые PDF
+uploads/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+venv*/
+.venv/
+
+# Калибровочные HTML-отчёты (генерируются calibrate_zones.py / check_scan.py на лету)
+*_calibrate.html
+*_check.html

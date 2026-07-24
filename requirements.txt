@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+watchdog
+pyzbar
+Pillow
+python-multipart
+requests
+PyMuPDF
+pypdfium2
