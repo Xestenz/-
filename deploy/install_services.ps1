@@ -10,14 +10,17 @@
 # сессии — см. раздел «Деплой на сервере» в GUIDE.md.
 #
 # Перед запуском: nssm.exe должен лежать в $RepoPath (скачать с https://nssm.cc/download),
-# venv должен быть создан и зависимости поставлены (см. деплой-раздел GUIDE.md).
+# зависимости должны быть поставлены (python -m pip install -r requirements.txt).
 
 param(
-    [string]$RepoPath = "C:\Apps\waybill",
-    [string]$NssmExe  = "C:\Apps\waybill\nssm.exe",
+    [string]$RepoPath = "D:\Users\operator9\Desktop\waybill",
+    [string]$NssmExe  = "D:\Users\operator9\Desktop\waybill\nssm.exe",
+    # Путь к python.exe. По умолчанию берём тот, что первым найдётся в PATH
+    # (venv не используется — зависимости ставились в системный Python).
+    [string]$PythonExe = "python.exe",
     # Учётка, под которой будет работать служба MonitorPL — важно указать,
-    # если сетевая шара со сканами (\\1C-SQL\Scans) доступна не системной
-    # учётке Local System, а конкретному пользователю/сервисному аккаунту.
+    # если сетевая шара со сканами доступна не системной учётке Local System,
+    # а конкретному пользователю/сервисному аккаунту.
     # Пример: -ServiceUser ".\waybill_service" (или "ДОМЕН\waybill_service")
     [string]$ServiceUser,
     [string]$ServicePassword
@@ -28,9 +31,9 @@ if (-not (Test-Path $NssmExe)) {
     exit 1
 }
 
-$python = Join-Path $RepoPath "venv\Scripts\python.exe"
-if (-not (Test-Path $python)) {
-    Write-Error "Не найден venv по пути $python. Сначала: python -m venv venv; venv\Scripts\pip install -r requirements.txt"
+$python = (Get-Command $PythonExe -ErrorAction SilentlyContinue).Source
+if (-not $python) {
+    Write-Error "python не найден в PATH. Проверь: python --version"
     exit 1
 }
 

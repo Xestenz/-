@@ -3,11 +3,11 @@
 #
 # Использование:
 #   .\deploy\update.ps1                 — подтянуть код и перезапустить оба процесса
-#   .\deploy\update.ps1 -UpdateDeps     — то же + переустановить зависимости venv
+#   .\deploy\update.ps1 -UpdateDeps     — то же + переустановить зависимости
 #                                          (нужно, если менялся requirements.txt)
 
 param(
-    [string]$RepoPath = "C:\Apps\waybill",
+    [string]$RepoPath = "D:\Users\operator9\Desktop\waybill",
     [switch]$UpdateDeps
 )
 
@@ -22,7 +22,7 @@ if ($LASTEXITCODE -ne 0) {
 
 if ($UpdateDeps) {
     Write-Host "== pip install -r requirements.txt ==" -ForegroundColor Cyan
-    & "$RepoPath\venv\Scripts\pip.exe" install -r requirements.txt
+    python -m pip install -r requirements.txt
 }
 
 Write-Host "== restart MonitorPL (служба) ==" -ForegroundColor Cyan
