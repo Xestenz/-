@@ -45,6 +45,15 @@
    git clone <URL-репозитория> C:\Apps\waybill
    cd C:\Apps\waybill
    ```
+   Если клонирование по SSH зависает / рвётся (`Connection closed... port 22`) —
+   в сети компании часто блокируют порт 22 наружу. Обход: GitHub принимает SSH
+   и на 443 порту. В `~/.ssh/config` (или `C:\Users\<user>\.ssh\config`):
+   ```
+   Host github.com
+     HostName ssh.github.com
+     Port 443
+     User git
+   ```
 3. Создать venv и поставить зависимости:
    ```
    python -m venv venv
