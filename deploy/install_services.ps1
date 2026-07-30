@@ -14,7 +14,13 @@
 
 param(
     [string]$RepoPath = "C:\Apps\waybill",
-    [string]$NssmExe  = "C:\Apps\waybill\nssm.exe"
+    [string]$NssmExe  = "C:\Apps\waybill\nssm.exe",
+    # Учётка, под которой будет работать служба MonitorPL — важно указать,
+    # если сетевая шара со сканами (\\1C-SQL\Scans) доступна не системной
+    # учётке Local System, а конкретному пользователю/сервисному аккаунту.
+    # Пример: -ServiceUser ".\waybill_service" (или "ДОМЕН\waybill_service")
+    [string]$ServiceUser,
+    [string]$ServicePassword
 )
 
 if (-not (Test-Path $NssmExe)) {
@@ -38,6 +44,14 @@ New-Item -ItemType Directory -Force -Path (Join-Path $RepoPath "logs") | Out-Nul
 & $NssmExe set MonitorPL AppRotateBytes 5242880
 & $NssmExe set MonitorPL Start SERVICE_AUTO_START
 & $NssmExe set MonitorPL AppRestartDelay 5000
+
+if ($ServiceUser) {
+    if (-not $ServicePassword) {
+        Write-Error "Указан -ServiceUser, но не указан -ServicePassword."
+        exit 1
+    }
+    & $NssmExe set MonitorPL ObjectName $ServiceUser $ServicePassword
+}
 
 & $NssmExe start MonitorPL
 

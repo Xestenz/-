@@ -98,6 +98,12 @@
    ```
    .\deploy\install_services.ps1
    ```
+   Если `\\1C-SQL\Scans` доступна не всем подряд, а под отдельной учёткой —
+   указать её явно, иначе служба по умолчанию работает под `Local System` и
+   может не достучаться до шары (`file_missing` в логе):
+   ```
+   .\deploy\install_services.ps1 -ServiceUser ".\waybill_service" -ServicePassword "пароль"
+   ```
    Проверить: `Get-Service MonitorPL` — должна быть `Running`.
 8. Только когда в `logs\MonitorPL.out.log` цифры выглядят разумно — в `.env`
    поставить `DRY_RUN=0` и `nssm restart MonitorPL`.
