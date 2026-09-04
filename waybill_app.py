@@ -46,7 +46,7 @@ def _load_env():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
+            os.environ[k.strip()] = v.strip()
 
 _load_env()
 
@@ -62,12 +62,30 @@ API_PASS = os.environ.get("API_PASS", "")
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
-# Детектирование пустых/заполненных полей через vision-модель (OpenRouter)
+# Детектирование пустых/заполненных полей через vision-модель
 # вместо плотности пикселей (печатные линии формы давали ложные срабатывания)
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-OPENROUTER_URL     = "https://openrouter.ai/api/v1/chat/completions"
+# Провайдер OpenAI-совместимый (chat/completions + image_url)
+# Выбор провайдера: openrouter или aitunnel (в .env через AI_PROVIDER)
 USE_AI_DETECTION   = True
-AI_MODEL           = "anthropic/claude-sonnet-4.6"
+AI_MODEL           = os.environ.get("AI_MODEL", "anthropic/claude-sonnet-4.6")
+AI_PROVIDER        = os.environ.get("AI_PROVIDER", "openrouter").lower().strip()
+
+# Загрузка конфига провайдера
+if AI_PROVIDER == "aitunnel":
+    AI_API_KEY = os.environ.get("AITUNNEL_API_KEY", "")
+    AI_BASE_URL = os.environ.get("AITUNNEL_URL", "https://api.aitunnel.ru/v1")
+else:  # openrouter
+    AI_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+    AI_BASE_URL = os.environ.get("OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions")
+
+# Deprecated (для совместимости):
+OPENROUTER_API_KEY = AI_API_KEY
+OPENROUTER_URL     = AI_BASE_URL
+
+# Debug: проверяем что загрузилось
+print(f"[DEBUG] AI_PROVIDER={AI_PROVIDER}")
+print(f"[DEBUG] AI_MODEL={AI_MODEL}")
+print(f"[DEBUG] AI_BASE_URL={AI_BASE_URL}")
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -652,17 +670,18 @@ _AI_FIELD_DESCRIPTIONS = """\
 
 def detect_fields_with_ai(file_path: str) -> dict:
     """
-    Определяет заполненные/пустые поля скана через vision-модель на OpenRouter.
+    Определяет заполненные/пустые поля скана через vision-модель.
     Гибридный подход: целая страница (контекст + широкие поля) + увеличенные
     вырезки для узких полей — в одном API-запросе.
     При ошибке откатывается на detect_filled_fields().
+    Провайдер выбирается через AI_PROVIDER в .env (openrouter или aitunnel).
     """
     result = {k: False for k in SCAN_FIELDS}
     try:
         if not file_path.lower().endswith(".pdf"):
             return detect_filled_fields(file_path)
-        if not OPENROUTER_API_KEY:
-            log.warning("OPENROUTER_API_KEY не задан — fallback на пиксельный метод")
+        if not AI_API_KEY:
+            log.warning("AI_API_KEY не задан (%s) — fallback на пиксельный метод", AI_PROVIDER)
             return detect_filled_fields(file_path)
 
         doc_scan = pdfium.PdfDocument(file_path)
@@ -751,19 +770,23 @@ def detect_fields_with_ai(file_path: str) -> dict:
             "messages": [{"role": "user", "content": content}],
         }
         headers = {
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {AI_API_KEY}",
             "Content-Type": "application/json",
         }
+        # Debug: логируем параметры запроса
+        log.info(f"AI запрос к {AI_PROVIDER}: {AI_MODEL}")
         for attempt in range(3):
-            resp = requests.post(OPENROUTER_URL, headers=headers,
+            resp = requests.post(AI_BASE_URL, headers=headers,
                                  json=payload, timeout=90)
             if resp.status_code in (429, 502, 503):
                 wait = 5 * (attempt + 1)
-                log.warning("OpenRouter %s, повтор через %ds (попытка %d/3)",
+                log.warning("AI-провайдер %s, повтор через %ds (попытка %d/3)",
                             resp.status_code, wait, attempt + 1)
                 time.sleep(wait)
                 continue
             break
+        if resp.status_code >= 400:
+            log.error("AI-провайдер ответил %s: %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
         text = resp.json()["choices"][0]["message"]["content"].strip()
         if text.startswith("```"):
@@ -830,26 +853,45 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
             pass
         return None
 
-    # Дата составления — 3 квадрата ДД|ММ|ГГГГ (каждый квадрат отдельно)
+    # Дата составления — 3 квадрата ДД|ММ|ГГГГ (каждый квадрат отдельно).
+    # Перетаскивание двигает единую метку "work_date" — сдвигаем все 3 квадрата
+    # на ту же дельту (в координатах скана), а не только первый.
     if not filled_on_scan.get("work_date"):
         date_str = str(fields.get("work_date", "")).strip()
         if date_str:
             parts = date_str.replace("-", ".").replace("/", ".").split(".")
             parts += ["", "", ""]
-            for text, (x, y) in zip(parts[:3], _DATE_BOXES):
-                if text:
-                    ins(x, y, text)
+            override = _pct_override("work_date")
+            if override:
+                ref_xp, ref_yp = _tmpl_to_scan_pt(_DATE_BOXES[0][0], _DATE_BOXES[0][1], sw, sh)
+                dx, dy = override[0] - ref_xp, override[1] - ref_yp
+                for text, (x, y) in zip(parts[:3], _DATE_BOXES):
+                    if text:
+                        xp, yp = _tmpl_to_scan_pt(x, y, sw, sh)
+                        ins_scan(xp + dx, yp + dy, text)
+            else:
+                for text, (x, y) in zip(parts[:3], _DATE_BOXES):
+                    if text:
+                        ins(x, y, text)
 
     # Период работы "с" и "по"
     if not filled_on_scan.get("period_from"):
         val = str(fields.get("period_from", "")).strip()
         if val:
-            ins(_PERIOD_FROM[0], _PERIOD_FROM[1], val, fsize=_PERIOD_FSIZE)
+            override = _pct_override("period_from")
+            if override:
+                ins_scan(override[0], override[1], val, fsize=_PERIOD_FSIZE)
+            else:
+                ins(_PERIOD_FROM[0], _PERIOD_FROM[1], val, fsize=_PERIOD_FSIZE)
 
     if not filled_on_scan.get("period_to"):
         val = str(fields.get("period_to", "")).strip()
         if val:
-            ins(_PERIOD_TO[0], _PERIOD_TO[1], val, fsize=_PERIOD_FSIZE)
+            override = _pct_override("period_to")
+            if override:
+                ins_scan(override[0], override[1], val, fsize=_PERIOD_FSIZE)
+            else:
+                ins(_PERIOD_TO[0], _PERIOD_TO[1], val, fsize=_PERIOD_FSIZE)
 
     # Остальные поля — эффективная точка вставки (заводская или автокалиброванная)
     for field in SCAN_FIELDS:
@@ -1045,26 +1087,6 @@ async def index():
     ))
 
 
-@app.post("/load-folder")
-async def load_folder():
-    """Обработать все файлы уже лежащие в SCAN_FOLDER."""
-    scan_path = Path(SCAN_FOLDER)
-    found = []
-    for ext in SUPPORTED_EXTENSIONS:
-        found.extend(scan_path.glob(f"*{ext}"))
-        found.extend(scan_path.glob(f"*{ext.upper()}"))
-
-    # пропустить уже загруженные файлы
-    loaded_paths = {w["file_path"] for w in waybills.values()}
-    new_files = [f for f in found if str(f) not in loaded_paths]
-
-    for f in new_files:
-        threading.Thread(target=_handle_new_scan, args=(str(f),), daemon=True).start()
-        time.sleep(0.3)
-
-    return JSONResponse({"loaded": len(new_files), "skipped": len(found) - len(new_files)})
-
-
 @app.post("/upload")
 async def upload_file(request: Request):
     """Принять файл загруженный через браузер и обработать его."""
@@ -1151,8 +1173,15 @@ def _overlay_positions(w: dict) -> dict:
         return {}
     disp_w, disp_h = _disp_dims(sw, sh)
     positions = {}
+    # Поля со спец-вставкой в PDF (тесные квадраты) — своей точки в SCAN_FIELDS
+    # не имеют, поэтому для превью берём те же координаты, что и при печати.
+    special_ins = {
+        "work_date":   _DATE_BOXES[0],
+        "period_from": _PERIOD_FROM,
+        "period_to":   _PERIOD_TO,
+    }
     for field in SCAN_FIELDS:
-        eff = _effective_ins(field)
+        eff = _effective_ins(field) or special_ins.get(field)
         if eff is None:
             continue
         xp, yp = _tmpl_to_scan_pt(eff[0], eff[1], sw, sh)
@@ -1431,7 +1460,6 @@ a:hover{{text-decoration:underline}}
   <div class="stat ok"><div class="num">{count_confirmed}</div><p>Подтверждено</p></div>
 </div>
 <div class="actions">
-  <button class="btn btn-blue" onclick="loadFolder()">↻ Загрузить из папки {scan_folder}</button>
   <label class="upload-label">
     ↑ Загрузить файлы вручную
     <input type="file" id="upload-input" multiple accept=".pdf,.jpg,.jpeg,.png,.tif,.tiff" onchange="uploadFiles(this.files)">
@@ -1444,17 +1472,6 @@ a:hover{{text-decoration:underline}}
 </table>
 <p class="tip">Или просто положите скан в папку <strong>{scan_folder}</strong> — браузер откроется автоматически.</p>
 <script>
-async function loadFolder() {{
-  const msg = document.getElementById('msg');
-  msg.style.color = '#999'; msg.textContent = 'Загружаю...';
-  const r = await fetch('/load-folder', {{method:'POST'}});
-  const d = await r.json();
-  msg.style.color = '#27ae60';
-  msg.textContent = d.loaded > 0
-    ? 'Загружено файлов: ' + d.loaded + (d.skipped ? ' (пропущено уже загруженных: ' + d.skipped + ')' : '')
-    : 'Новых файлов не найдено' + (d.skipped ? ' (уже загружены: ' + d.skipped + ')' : '');
-  setTimeout(() => location.reload(), 2000);
-}}
 async function uploadFiles(files) {{
   const msg = document.getElementById('msg');
   msg.style.color = '#999'; msg.textContent = 'Загружаю ' + files.length + ' файл(ов)...';
