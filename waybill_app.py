@@ -184,9 +184,18 @@ def _effective_ins(field: str):
     if field in _field_overrides:
         return _field_overrides[field]
     coords = SCAN_FIELDS.get(field)
-    if not coords or coords[4] is None:
-        return None
-    return coords[4], coords[5]
+    if coords and coords[4] is not None:
+        return coords[4], coords[5]
+
+    # Эти поля печатаются специальной логикой, поэтому их точки не записаны
+    # непосредственно в SCAN_FIELDS. Всё равно возвращаем их здесь, чтобы
+    # live-превью, отчёт и автокалибровка использовали одну систему координат.
+    special = {
+        "work_date": _DATE_BOXES[0],
+        "period_from": _PERIOD_FROM,
+        "period_to": _PERIOD_TO,
+    }
+    return special.get(field)
 
 
 def _median(values: list) -> float:
@@ -383,8 +392,10 @@ _DATE_BOXES = [(703, 96), (733, 96), (759, 96)]
 # "Период работы": "с" x=506..544 (ширина 38pt, центр 525), "по" x=544..578 (ширина 33.5pt, центр 561)
 # Подтверждено по положению лейблов 'с' (x=524) и 'по' (x=558) в шаблоне
 _PERIOD_FSIZE = 7
-_PERIOD_FROM  = (516, 215)   # центр колонки "с": 506+38/2=525, "30.06"~17pt → старт 525-8=517
-_PERIOD_TO    = (552, 215)   # центр колонки "по": 544+33.5/2=561, "30.06"~17pt → старт 561-8=553
+# По трём фактическим перетаскиваниям оператора медианная базовая линия —
+# 208pt (прежние 215pt печатали значения примерно на 7pt ниже нужного места).
+_PERIOD_FROM  = (516, 208)   # центр колонки "с": 506+38/2=525, "30.06"~17pt → старт 525-8=517
+_PERIOD_TO    = (552, 208)   # центр колонки "по": 544+33.5/2=561, "30.06"~17pt → старт 561-8=553
 
 # ---------------------------------------------------------------------------
 # Зоны детектирования в координатах ЛАНДШАФТНОГО ШАБЛОНА (842×595pt)
@@ -870,9 +881,12 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
                         xp, yp = _tmpl_to_scan_pt(x, y, sw, sh)
                         ins_scan(xp + dx, yp + dy, text)
             else:
+                effective = _effective_ins("work_date")
+                dx = effective[0] - _DATE_BOXES[0][0]
+                dy = effective[1] - _DATE_BOXES[0][1]
                 for text, (x, y) in zip(parts[:3], _DATE_BOXES):
                     if text:
-                        ins(x, y, text)
+                        ins(x + dx, y + dy, text)
 
     # Период работы "с" и "по"
     if not filled_on_scan.get("period_from"):
@@ -882,7 +896,8 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
             if override:
                 ins_scan(override[0], override[1], val, fsize=_PERIOD_FSIZE)
             else:
-                ins(_PERIOD_FROM[0], _PERIOD_FROM[1], val, fsize=_PERIOD_FSIZE)
+                x, y = _effective_ins("period_from")
+                ins(x, y, val, fsize=_PERIOD_FSIZE)
 
     if not filled_on_scan.get("period_to"):
         val = str(fields.get("period_to", "")).strip()
@@ -891,7 +906,8 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
             if override:
                 ins_scan(override[0], override[1], val, fsize=_PERIOD_FSIZE)
             else:
-                ins(_PERIOD_TO[0], _PERIOD_TO[1], val, fsize=_PERIOD_FSIZE)
+                x, y = _effective_ins("period_to")
+                ins(x, y, val, fsize=_PERIOD_FSIZE)
 
     # Остальные поля — эффективная точка вставки (заводская или автокалиброванная)
     for field in SCAN_FIELDS:
@@ -1173,15 +1189,8 @@ def _overlay_positions(w: dict) -> dict:
         return {}
     disp_w, disp_h = _disp_dims(sw, sh)
     positions = {}
-    # Поля со спец-вставкой в PDF (тесные квадраты) — своей точки в SCAN_FIELDS
-    # не имеют, поэтому для превью берём те же координаты, что и при печати.
-    special_ins = {
-        "work_date":   _DATE_BOXES[0],
-        "period_from": _PERIOD_FROM,
-        "period_to":   _PERIOD_TO,
-    }
     for field in SCAN_FIELDS:
-        eff = _effective_ins(field) or special_ins.get(field)
+        eff = _effective_ins(field)
         if eff is None:
             continue
         xp, yp = _tmpl_to_scan_pt(eff[0], eff[1], sw, sh)
