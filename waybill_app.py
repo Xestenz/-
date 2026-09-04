@@ -67,6 +67,7 @@ SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 # Провайдер OpenAI-совместимый (chat/completions + image_url)
 # Выбор провайдера: openrouter или aitunnel (в .env через AI_PROVIDER)
 USE_AI_DETECTION   = True
+USE_PIXEL_FALLBACK = os.environ.get("USE_PIXEL_FALLBACK", "0").strip().lower() in ("1", "true", "yes")
 AI_MODEL           = os.environ.get("AI_MODEL", "anthropic/claude-sonnet-4.6")
 AI_PROVIDER        = os.environ.get("AI_PROVIDER", "openrouter").lower().strip()
 
@@ -684,17 +685,24 @@ def detect_fields_with_ai(file_path: str) -> dict:
     Определяет заполненные/пустые поля скана через vision-модель.
     Гибридный подход: целая страница (контекст + широкие поля) + увеличенные
     вырезки для узких полей — в одном API-запросе.
-    При ошибке откатывается на detect_filled_fields().
+    Пиксельный fallback используется только при USE_PIXEL_FALLBACK=1.
     Провайдер выбирается через AI_PROVIDER в .env (openrouter или aitunnel).
     """
     result = {k: False for k in SCAN_FIELDS}
-    try:
-        if not file_path.lower().endswith(".pdf"):
-            return detect_filled_fields(file_path)
-        if not AI_API_KEY:
-            log.warning("AI_API_KEY не задан (%s) — fallback на пиксельный метод", AI_PROVIDER)
-            return detect_filled_fields(file_path)
 
+    if not file_path.lower().endswith(".pdf"):
+        if USE_PIXEL_FALLBACK:
+            log.warning("AI-анализ поддерживает только PDF — используем пиксельный fallback")
+            return detect_filled_fields(file_path)
+        raise RuntimeError("AI-анализ поддерживает только PDF; пиксельный fallback отключён")
+
+    if not AI_API_KEY:
+        if USE_PIXEL_FALLBACK:
+            log.warning("AI-ключ не задан (%s) — используем пиксельный fallback", AI_PROVIDER)
+            return detect_filled_fields(file_path)
+        raise RuntimeError(f"AI-ключ не задан для провайдера {AI_PROVIDER}; пиксельный fallback отключён")
+
+    try:
         doc_scan = pdfium.PdfDocument(file_path)
         if len(doc_scan) == 0:
             return result
@@ -810,8 +818,13 @@ def detect_fields_with_ai(file_path: str) -> dict:
             result[field] = bool(ai_result.get(field, False))
         log.info("Детектирование (AI+crop) %s: %s", Path(file_path).name, result)
     except Exception as exc:
-        log.error("detect_fields_with_ai: %s — fallback на пиксельный метод", exc)
-        return detect_filled_fields(file_path)
+        if USE_PIXEL_FALLBACK:
+            log.error("detect_fields_with_ai: %s — используем пиксельный fallback", exc)
+            return detect_filled_fields(file_path)
+        log.error("detect_fields_with_ai: %s — пиксельный fallback отключён", exc)
+        raise RuntimeError(
+            f"AI-анализ не выполнен ({AI_PROVIDER}); пиксельный fallback отключён"
+        ) from exc
     return result
 
 
@@ -1007,14 +1020,20 @@ def _handle_new_scan(file_path: str):
         "filled_on_scan": {},
         "error":          None,
         "warning":        None,
+        "detection_warning": None,
     }
     waybills[job_id] = entry
 
     # Определяем заполненные поля на скане (до запроса 1С)
-    entry["filled_on_scan"] = (
-        detect_fields_with_ai(file_path) if USE_AI_DETECTION
-        else detect_filled_fields(file_path)
-    )
+    try:
+        entry["filled_on_scan"] = (
+            detect_fields_with_ai(file_path) if USE_AI_DETECTION
+            else detect_filled_fields(file_path)
+        )
+    except Exception as exc:
+        entry["filled_on_scan"] = {}
+        entry["detection_warning"] = str(exc)
+        log.error("  %s", exc)
 
     # Читаем штрихкод
     barcode = read_barcode(file_path)
@@ -1626,6 +1645,14 @@ def _render_waybill(w: dict) -> str:
             f'padding:8px;margin-bottom:10px;font-size:13px;color:#7a5b00">⚠ {w["warning"]}</div>'
         )
 
+    detection_warn_block = ""
+    if w.get("detection_warning"):
+        detection_warn_block = (
+            f'<div style="background:#fde2e2;border:2px solid #c00;border-radius:4px;'
+            f'padding:9px;margin-bottom:10px;font-size:13px;color:#8b0000">'
+            f'⚠ {html.escape(str(w["detection_warning"]))}. Проверьте заполненные от руки поля вручную.</div>'
+        )
+
     order_info = ""
     if f.get("order_number") or f.get("order_status") or f.get("shift_status"):
         order_info = (
@@ -1724,6 +1751,7 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
       Добавлен: {w['created_at'][11:19]}
     </div>
     {err_block}
+    {detection_warn_block}
     {warn_block}
     {order_info}
     <div class="legend">
