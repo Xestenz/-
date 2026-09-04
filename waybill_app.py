@@ -50,7 +50,7 @@ def _load_env():
 
 _load_env()
 
-SCAN_FOLDER   = r"C:\Scans"      # <<< ИЗМЕНИТЬ: путь к папке куда сохраняет сканер
+SCAN_FOLDER   = os.environ.get("SCAN_FOLDER", r"C:\Scans")
 TEMPLATE_PATH = Path(__file__).parent / "template_esm2.pdf"
 
 WEB_HOST = "127.0.0.1"
