@@ -814,8 +814,12 @@ def detect_fields_with_ai(file_path: str) -> dict:
                 text = text[4:]
         ai_result = json.loads(text)
 
+        if not isinstance(ai_result, dict) or any(
+            type(ai_result.get(field)) is not bool for field in field_names
+        ):
+            raise ValueError("AI вернул неполный или некорректный анализ полей")
         for field in field_names:
-            result[field] = bool(ai_result.get(field, False))
+            result[field] = ai_result[field]
         log.info("Детектирование (AI+crop) %s: %s", Path(file_path).name, result)
     except Exception as exc:
         if USE_PIXEL_FALLBACK:
@@ -828,22 +832,30 @@ def detect_fields_with_ai(file_path: str) -> dict:
     return result
 
 
-def fill_scan_pdf(scan_path: str, fields: dict, filled_on_scan: dict) -> bytes:
+def fill_scan_pdf(scan_path: str, fields: dict, filled_on_scan: dict, *, additions_only: bool = False) -> bytes:
     """Обёртка с блокировкой — см. _fill_scan_pdf_impl()."""
     with _pdf_lock:
-        return _fill_scan_pdf_impl(scan_path, fields, filled_on_scan)
+        return _fill_scan_pdf_impl(scan_path, fields, filled_on_scan, additions_only=additions_only)
 
 
-def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> bytes:
+def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, additions_only: bool = False) -> bytes:
     """
-    Берёт оригинальный скан PDF и дописывает текст поверх пустых полей.
+    Создаёт копию скана с дополнениями или только дополнения для оригинала.
+    В режиме additions_only скан задаёт размеры, но не включается в результат.
     Автоматически определяет ориентацию скана (портрет/ландшафт) и
     применяет нужный поворот текста и трансформацию координат.
     """
-    doc = fitz.open(scan_path)
-    p1 = doc[0]
-    sw = p1.rect.width
-    sh = p1.rect.height
+    if any(type(filled_on_scan.get(field)) is not bool for field in SCAN_FIELDS):
+        raise ValueError("Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
+    with fitz.open(scan_path) as source:
+        sw = source[0].rect.width
+        sh = source[0].rect.height
+    if additions_only:
+        doc = fitz.open()
+        p1 = doc.new_page(width=sw, height=sh)
+    else:
+        doc = fitz.open(scan_path)
+        p1 = doc[0]
     portrait = _scan_is_portrait(sw, sh)
     rot = 270 if portrait else 0   # 270° = 90° CW = текст читается как в ландшафте
 
@@ -880,7 +892,7 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
     # Дата составления — 3 квадрата ДД|ММ|ГГГГ (каждый квадрат отдельно).
     # Перетаскивание двигает единую метку "work_date" — сдвигаем все 3 квадрата
     # на ту же дельту (в координатах скана), а не только первый.
-    if not filled_on_scan.get("work_date"):
+    if not any(filled_on_scan.get(key) for key in ("work_date", "work_date_2", "work_date_3")):
         date_str = str(fields.get("work_date", "")).strip()
         if date_str:
             parts = date_str.replace("-", ".").replace("/", ".").split(".")
@@ -950,7 +962,7 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict) -> b
                 ins(cx0 + 2, cy1 - 12 + i * 11, line, fsize=_ORG_FSIZE)
 
     # Метаданные страницы: говорим любому просмотрщику/принтеру повернуть
-    # при показе — тогда и скан, и наш текст выглядят единообразно ровно
+    # при показе — тогда наш текст выглядит так же, как предпросмотр скана
     # (без этого предпросмотр в приложении был ровным, а открытый PDF — нет).
     if portrait:
         p1.set_rotation(270)
@@ -1415,16 +1427,23 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=404)
 
     form      = await request.form()
+    if w.get("detection_warning") or any(
+        type(w.get("filled_on_scan", {}).get(field)) is not bool for field in SCAN_FIELDS
+    ):
+        raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
     fields    = dict(form)
+    print_mode = fields.pop("print_mode", "copy")
+    if print_mode not in ("copy", "additions"):
+        raise HTTPException(status_code=400, detail="Неизвестный режим печати")
     pl_number = w.get("pl_number") or fields.pop("pl_number_manual", "") or "???"
 
     w["fields"] = fields
-    log.info("Путевой %s — накладываем поля на скан", pl_number)
+    log.info("Путевой %s — режим печати: %s", pl_number, print_mode)
 
     try:
         scan_path = w["file_path"]
         filled_on_scan = w.get("filled_on_scan", {})
-        pdf_bytes = fill_scan_pdf(scan_path, fields, filled_on_scan)
+        pdf_bytes = fill_scan_pdf(scan_path, fields, filled_on_scan, additions_only=print_mode == "additions")
     except Exception as exc:
         log.error("Ошибка генерации PDF: %s", exc)
         _save_state()
@@ -1434,7 +1453,7 @@ async def print_waybill(job_id: str, request: Request):
     _save_state()
     _auto_calibrate()
 
-    filename = f"PL_{pl_number}.pdf"
+    filename = f"PL_{pl_number}_{print_mode}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -1627,11 +1646,21 @@ def _render_waybill(w: dict) -> str:
         fld("driver_id",     "Табельный №"),
     ]) + sec("Объект и время работы (до 3 дней)") + day_rows_html
 
-    btn_html = "" if confirmed else """
-    <button type="button" onclick="printWaybill()"
+    btn_html = """
+    <button type="button" onclick="printWaybill('copy', this)"
+      style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
+             border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
+      🖨 Распечатать копию со сканом
+    </button>
+    <p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
+      Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.
+      Вставьте в принтер исходный бумажный путевой. Печатайте в масштабе 100%
+      («Фактический размер»), без подгонки под страницу. Сначала проверьте
+      совпадение на пробном листе, приложив его к оригиналу на просвет.</p>
+    <button id="print-button" type="button" onclick="printWaybill('additions', this)"
       style="width:100%;padding:14px;background:#27ae60;color:white;border:none;
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
-      🖨 Дозаполнить и распечатать
+      🖨 Допечатать на оригинале
     </button>"""
 
     err_block = ""
@@ -1650,7 +1679,7 @@ def _render_waybill(w: dict) -> str:
         detection_warn_block = (
             f'<div style="background:#fde2e2;border:2px solid #c00;border-radius:4px;'
             f'padding:9px;margin-bottom:10px;font-size:13px;color:#8b0000">'
-            f'⚠ {html.escape(str(w["detection_warning"]))}. Проверьте заполненные от руки поля вручную.</div>'
+            f'⚠ {html.escape(str(w["detection_warning"]))}. Печать недоступна. Повторно загрузите скан для анализа.</div>'
         )
 
     order_info = ""
@@ -1868,16 +1897,18 @@ switchPage(0);
   updateOverlayVisibility();
 }})();
 
-async function printWaybill() {{
-  const btn = document.querySelector('button');
+async function printWaybill(mode, btn) {{
+  const originalLabel = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Формирую PDF...';
   const msg = document.getElementById('msg');
   msg.style.display = 'none';
   try {{
+    const data = new FormData(document.getElementById('frm'));
+    data.set('print_mode', mode);
     const resp = await fetch('/print/{w["id"]}', {{
       method: 'POST',
-      body: new FormData(document.getElementById('frm'))
+      body: data
     }});
     if (!resp.ok) {{
       const txt = await resp.text();
@@ -1886,12 +1917,12 @@ async function printWaybill() {{
     const blob = await resp.blob();
     const url  = URL.createObjectURL(blob);
     window.open(url, '_blank');
-    btn.textContent = '🖨 Распечатать путевой';
+    btn.textContent = originalLabel;
     btn.disabled = false;
   }} catch(e) {{
     msg.style.display = 'block';
     msg.className = 'err-msg'; msg.textContent = 'Ошибка: ' + e;
-    btn.textContent = '🖨 Распечатать путевой';
+    btn.textContent = originalLabel;
     btn.disabled = false;
   }}
 }}
