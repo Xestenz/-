@@ -4,6 +4,8 @@
 # Рантайм-состояние (реальные данные путевых, накапливается на конкретной машине)
 waybills_state.json
 field_position_overrides.json
+monitor_pl_queue.json
+monitor_pl_queue.json.tmp
 
 # Загруженные сканы / тестовые PDF
 uploads/

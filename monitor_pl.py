@@ -6,6 +6,7 @@
 """
 
 import base64
+import json
 import logging
 import os
 import re
@@ -59,6 +60,44 @@ MAX_ORDERS_PER_RUN = int(os.environ.get("MAX_ORDERS_PER_RUN", "50"))
 PL_BARCODE_PATTERN = re.compile(r"^\d{13}$")
 
 LOG_FILE = str(Path(__file__).parent / "monitor_pl.log")
+QUEUE_STATE_FILE = Path(__file__).parent / "monitor_pl_queue.json"
+
+
+def _queue_key(order: dict) -> str:
+    # Один заказ может содержать несколько смен и файлов.
+    return json.dumps([order.get("id", ""), order.get("namef", "")], ensure_ascii=False)
+
+
+def _load_queue_state() -> dict:
+    try:
+        state = json.loads(QUEUE_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise ValueError("Ожидался объект состояния очереди")
+        return {key: value for key, value in state.items()
+                if isinstance(value, (int, float)) and value >= 0}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("Не удалось прочитать очередь, начинаем новый обход: %s", exc)
+        return {}
+
+
+def _save_queue_state(state: dict) -> None:
+    try:
+        temporary = QUEUE_STATE_FILE.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, QUEUE_STATE_FILE)
+    except OSError as exc:
+        log.error("Не удалось сохранить очередь: %s", exc)
+
+
+def _select_batch(orders: list[dict], state: dict, limit: int) -> list[dict]:
+    # Сначала ещё не проверенные; затем те, которые проверялись раньше остальных.
+    # Номер заказа определяет порядок только при одинаковом приоритете.
+    unique = {_queue_key(order): order for order in orders}
+    ranked = sorted(unique.values(), key=lambda o: str(o.get("num", "")), reverse=True)
+    ranked.sort(key=lambda order: state.get(_queue_key(order), 0))
+    return ranked[:max(1, limit)]
 
 
 # ---------------------------------------------------------------------------
@@ -257,11 +296,11 @@ def process_order(order: dict) -> str:
         f"  Штрихкод:      {used_barcode}\n"
         f"  Номер путевого: {pl_number}"
     )
-    log.info("  OK → заказ %s, штрихкод %s, путевой %s",
+    log.info("  Код распознан (ещё не записан в 1С): заказ %s, штрихкод %s, путевой %s",
              order_num, used_barcode, pl_number)
 
     ok = write_pl_to_order(order_id, order_num, pl_number)
-    return "written" if ok else "write_failed"
+    return ("dry_run" if DRY_RUN else "written") if ok else "write_failed"
 
 
 def run_once() -> None:
@@ -279,16 +318,11 @@ def run_once() -> None:
         log.info("Заказов без путевого листа не найдено.")
         return
 
-    # API не отдаёт дату — сортируем по номеру заказа (присваивается по
-    # порядку, так что это и есть хронология). От новых к старым: новые
-    # обычно актуальнее и вероятнее найдутся на шаре, а по мере того как
-    # они обрабатываются и пропадают из очереди, "верхушка" списка на
-    # следующих циклах естественно сдвигается к более старым — без
-    # ручной пагинации и риска пропустить/повторить заказ.
-    orders.sort(key=lambda o: o.get("num", ""), reverse=True)
-
-    total = len(orders)
-    batch = orders[:MAX_ORDERS_PER_RUN]
+    state = _load_queue_state()
+    active_keys = {_queue_key(order) for order in orders}
+    state = {key: value for key, value in state.items() if key in active_keys}
+    total = len(active_keys)
+    batch = _select_batch(orders, state, MAX_ORDERS_PER_RUN)
     deferred = total - len(batch)
     log.info("Найдено заказов: %d. Обрабатываю %d за этот прогон%s.",
              total, len(batch),
@@ -303,9 +337,21 @@ def run_once() -> None:
                           order.get("num", "?"), exc)
             result = "exception"
         counts[result] = counts.get(result, 0) + 1
+        # Даже ошибка считается попыткой: следующая порция должна идти дальше.
+        state[_queue_key(order)] = time.time()
+        _save_queue_state(state)
 
-    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
-    log.info("=== Опрос завершён. Итог: %s ===\n", summary or "нет обработанных")
+    log.info(
+        "=== Итог: проверено=%d; записано в 1С=%d; пробных без записи=%d; "
+        "нет пути=%d; файл недоступен=%d; код не найден=%d; неверный формат=%d; "
+        "отказ записи=%d; исключений=%d ===",
+        len(batch), counts.get("written", 0), counts.get("dry_run", 0),
+        counts.get("empty_path", 0), counts.get("file_missing", 0),
+        counts.get("no_barcode", 0), counts.get("invalid_format", 0),
+        counts.get("write_failed", 0), counts.get("exception", 0),
+    )
+    unchecked = sum(key not in state for key in active_keys)
+    log.info("Ещё не проверено в текущей выборке: %d. Ошибочные записи будут повторяться по очереди.", unchecked)
 
 
 def main() -> None:
