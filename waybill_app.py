@@ -18,6 +18,8 @@ import sys
 import threading
 import time
 import uuid
+import re
+from urllib.parse import quote
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -182,6 +184,11 @@ def _save_field_overrides() -> None:
 
 def _effective_ins(field: str):
     """Текущая точка вставки поля — с учётом автокалибровки, если она уже накопилась."""
+    if field in ("customer", "company_name"):
+        x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
+        if field == "company_name":
+            x0 = 103  # Начало линии реквизитов после подписи «Организация».
+        return (x0 + x1) / 2, (126 if field == "customer" else y1 - 18)
     if field in _field_overrides:
         return _field_overrides[field]
     coords = SCAN_FIELDS.get(field)
@@ -218,6 +225,8 @@ def _collect_position_samples() -> dict:
         if not sw or not sh:
             continue
         for field in SCAN_FIELDS:
+            if field in ("customer", "company_name"):
+                continue  # Эти строки центрируются по границам поля.
             eff = _effective_ins(field)
             if eff is None:
                 continue
@@ -328,6 +337,7 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
         "vehicle_type":  rec.get("МашинаНаименование", ""),
         "work_object":   rec.get("ОбъектРаботНаименование", ""),
         "work_date":     work_date,
+        "api_work_date": work_date if work_day_1 else "",
         "work_day_1":    work_day_1,
         "work_object_1": rec.get("ОбъектРаботНаименование", ""),
         "order_number":  rec.get("НомерЗаказа", ""),
@@ -889,6 +899,22 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
             pass
         return None
 
+    def ins_centered(field: str, text: str, y: float, fsize: float):
+        x0, _, x1, _ = SCAN_FIELDS[field][:4]
+        if field == "company_name":
+            x0 = 103
+        display_w, _ = _disp_dims(sw, sh)
+        available = (x1 - x0 - 4) * display_w / _TMPL_W
+        font = fitz.Font(fontfile=_FONT)
+        width = font.text_length(text, fontsize=fsize)
+        if width > available:
+            fsize *= available / width
+            width = available
+        xp, yp = _tmpl_to_scan_pt((x0 + x1) / 2, y, sw, sh)
+        xd, yd = _raw_to_disp_pt(xp, yp, sw, sh)
+        xp, yp = _disp_to_raw_pt(xd - width / 2, yd, sw, sh)
+        ins_scan(xp, yp, text, fsize)
+
     # Дата составления — 3 квадрата ДД|ММ|ГГГГ (каждый квадрат отдельно).
     # Перетаскивание двигает единую метку "work_date" — сдвигаем все 3 квадрата
     # на ту же дельту (в координатах скана), а не только первый.
@@ -936,7 +962,7 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
 
     # Остальные поля — эффективная точка вставки (заводская или автокалиброванная)
     for field in SCAN_FIELDS:
-        if field in ("work_date", "period_from", "period_to"):
+        if field in ("work_date", "period_from", "period_to", "company_name"):
             continue
         if filled_on_scan.get(field):
             continue
@@ -945,6 +971,9 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
             continue
         val = str(fields.get(field, "")).strip()
         if not val:
+            continue
+        if field == "customer":
+            ins_centered(field, val, eff[1], _FSIZE)
             continue
         override = _pct_override(field)
         if override:
@@ -959,7 +988,7 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         org_lines = ORG_NAME.split("\n")
         for i, line in enumerate(org_lines[:2]):
             if line.strip():
-                ins(cx0 + 2, cy1 - 12 + i * 11, line, fsize=_ORG_FSIZE)
+                ins_centered("company_name", line, cy1 - 18 + i * 11, _ORG_FSIZE)
 
     # Метаданные страницы: говорим любому просмотрщику/принтеру повернуть
     # при показе — тогда наш текст выглядит так же, как предпросмотр скана
@@ -1419,6 +1448,46 @@ tr.applied{{background:#eaffea}}
 </body></html>""")
 
 
+def _pdf_filename(value: str, fallback: str = "Путевой") -> str:
+    """Безопасное имя PDF для Windows, без пути и повторного расширения."""
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', ' ', str(value))
+    value = re.sub(r'\s+', ' ', value).strip().rstrip('. ')
+    if value.lower().endswith('.pdf'):
+        value = value[:-4].rstrip('. ')
+    value = value[:160].rstrip('. ') or fallback
+    if value.split('.')[0].upper() in {'CON', 'PRN', 'AUX', 'NUL', *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10))}:
+        value = '_' + value
+    return value + '.pdf'
+
+
+def _default_pdf_name(w: dict) -> str:
+    fields = w.get("fields", {})
+    customer = str(fields.get("customer") or "").strip()
+    date = str(fields.get("work_date") or fields.get("api_work_date") or w.get("filename_date") or "").strip()
+    # В старых записях дата терялась после отправки пустого поля «на скане».
+    if not date and w.get("pl_number"):
+        try:
+            api_fields, _ = fetch_order_by_pl(w["pl_number"])
+            date = api_fields.get("api_work_date", "")
+            if date:
+                w["filename_date"] = date
+        except Exception as exc:
+            log.warning("Не удалось восстановить дату для имени PDF: %s", type(exc).__name__)
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d.%m.%y"):
+        try:
+            date = datetime.strptime(date, fmt).strftime("%d,%m")
+            break
+        except ValueError:
+            pass
+    name = _pdf_filename(fields.get("output_filename") or customer,
+                         f"PL_{w.get('pl_number') or w['id']}")[:-4]
+    # Сохранённое или введённое вручную имя тоже дополняем датой, без дубля.
+    if date and date not in name:
+        name += ' ' + date
+    return _pdf_filename(name,
+                         f"PL_{w.get('pl_number') or w['id']}")[:-4]
+
+
 @app.post("/print/{job_id}")
 async def print_waybill(job_id: str, request: Request):
     """Принять заполненные поля, сгенерировать PDF и вернуть его браузеру."""
@@ -1437,7 +1506,15 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=400, detail="Неизвестный режим печати")
     pl_number = w.get("pl_number") or fields.pop("pl_number_manual", "") or "???"
 
-    w["fields"] = fields
+    name_fields = {**w.get("fields", {}), **fields}
+    if not name_fields.get("work_date"):
+        name_fields["work_date"] = w.get("fields", {}).get("work_date", "")
+    name_entry = {**w, "fields": name_fields}
+    filename = _pdf_filename(_default_pdf_name(name_entry))
+    w["filename_date"] = name_entry.get("filename_date") or name_fields.get("work_date") or w.get("filename_date", "")
+    if print_mode == "additions":
+        filename = _pdf_filename(filename[:-4] + " — допечатка")
+    w["fields"] = {**w.get("fields", {}), **fields}
     log.info("Путевой %s — режим печати: %s", pl_number, print_mode)
 
     try:
@@ -1453,11 +1530,10 @@ async def print_waybill(job_id: str, request: Request):
     _save_state()
     _auto_calibrate()
 
-    filename = f"PL_{pl_number}_{print_mode}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+        headers={"Content-Disposition": f"inline; filename=\"waybill.pdf\"; filename*=UTF-8''{quote(filename)}"},
     )
 
 
@@ -1590,6 +1666,18 @@ def _render_waybill(w: dict) -> str:
     overlay_labels = []
     overlay_hidden = []
     for field, (dleft, dtop) in default_pos.items():
+        if field in ("customer", "company_name"):
+            if fos.get(field):
+                continue
+            x0, _, x1, _ = SCAN_FIELDS[field][:4]
+            if field == "company_name":
+                x0 = 103
+            overlay_labels.append(
+                f'<span class="live-label centered-label" data-field="{field}" '
+                f'data-width="{(x1 - x0 - 4) / _TMPL_W * 100}" '
+                f'style="left:{dleft}%;top:{dtop}%"></span>'
+            )
+            continue
         left = f.get(f"{field}_left_pct") or dleft
         top = f.get(f"{field}_top_pct") or dtop
         overlay_labels.append(
@@ -1645,6 +1733,15 @@ def _render_waybill(w: dict) -> str:
         fld("driver_name",   "Машинист (ФИО)"),
         fld("driver_id",     "Табельный №"),
     ]) + sec("Объект и время работы (до 3 дней)") + day_rows_html
+    fields_html += sec("Сохранение PDF") + (
+        '<label for="output-filename">Имя файла (можно изменить)</label>'
+        f'<input id="output-filename" name="output_filename" '
+        f'value="{html.escape(_default_pdf_name(w), quote=True)}" '
+        'style="width:100%;padding:8px;margin-top:5px" maxlength="160">'
+        '<p style="font-size:12px;color:#666">По умолчанию: заказчик и дата. '
+        'Номер техники при необходимости добавьте вручную, например: '
+        'КОРСТРОЙ ООО 48 ед 04,09. Расширение .pdf добавляется автоматически.</p>'
+    )
 
     btn_html = """
     <button type="button" onclick="printWaybill('copy', this)"
@@ -1661,7 +1758,13 @@ def _render_waybill(w: dict) -> str:
       style="width:100%;padding:14px;background:#27ae60;color:white;border:none;
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
       🖨 Допечатать на оригинале
-    </button>"""
+    </button>
+    <div style="display:flex;gap:8px;margin-top:12px">
+      <button type="button" onclick="printWaybill('copy', this, true)"
+        style="flex:1;padding:10px;cursor:pointer">💾 Сохранить копию PDF</button>
+      <button type="button" onclick="printWaybill('additions', this, true)"
+        style="flex:1;padding:10px;cursor:pointer">💾 Сохранить допечатку PDF</button>
+    </div>"""
 
     err_block = ""
     if w.get("error"):
@@ -1718,6 +1821,9 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
    отсюда "съезжание". Точность позиции важнее направления чтения подписи. */
 .live-label.has-text{{cursor:move;pointer-events:auto;background:#fff200;outline:2px solid #c0392b;border-radius:2px}}
 .live-label.dragging{{background:#ffd400}}
+.live-label.centered-label{{transform:translate(-50%,-0.9em);padding:0;font-weight:400;text-align:center;}}
+.live-label.centered-label.has-text{{cursor:default;pointer-events:none;}}
+.centered-label span{{display:block;}}
 #overlay-hint{{display:none;position:absolute;top:4px;left:4px;background:#000c;color:#ffd;
   font-size:11px;padding:4px 8px;border-radius:4px;z-index:5}}
 #overlay-hint.show{{display:block}}
@@ -1843,6 +1949,19 @@ switchPage(0);
   function applyFontSize() {{
     var px = fontScale();
     document.querySelectorAll('.live-label').forEach(function(l) {{ l.style.fontSize = px + 'px'; }});
+    document.querySelectorAll('.centered-label').forEach(function(l) {{
+      var scale = img.clientWidth / PAGE_W;
+      var size = (l.dataset.field === 'company_name' ? 8 : 9) * scale;
+      l.style.fontSize = size + 'px';
+      l.style.lineHeight = (11 * scale) + 'px';
+      var context = document.createElement('canvas').getContext('2d');
+      l.querySelectorAll('span').forEach(function(line) {{
+        context.font = size + 'px Arial';
+        var width = context.measureText(line.textContent).width;
+        var available = img.clientWidth * Number(l.dataset.width) / 100;
+        line.style.fontSize = (width > available ? size * available / width : size) + 'px';
+      }});
+    }});
   }}
   img.addEventListener('load', function() {{ applyFontSize(); updateOverlayVisibility(); }});
   window.addEventListener('resize', applyFontSize);
@@ -1852,7 +1971,16 @@ switchPage(0);
     var input = document.querySelector('#frm input[name="' + field + '"]');
     if (!input) return;
     function sync() {{
-      label.textContent = input.value;
+      if (label.classList.contains('centered-label')) {{
+        var text = field === 'company_name' ? {json.dumps(ORG_NAME, ensure_ascii=True)} : input.value;
+        label.replaceChildren();
+        text.split('\\n').forEach(function(value) {{
+          var line = document.createElement('span');
+          line.textContent = value;
+          label.appendChild(line);
+        }});
+        applyFontSize();
+      }} else {{ label.textContent = input.value; }}
       label.classList.toggle('has-text', !!input.value.trim());
       updateOverlayVisibility();
     }}
@@ -1863,6 +1991,7 @@ switchPage(0);
   var dragging = null;
   document.querySelectorAll('.live-label').forEach(function(label) {{
     label.addEventListener('mousedown', function(e) {{
+      if (label.classList.contains('centered-label')) return;
       if (!label.classList.contains('has-text')) return;
       var rect = wrap.getBoundingClientRect();
       dragging = {{
@@ -1897,7 +2026,7 @@ switchPage(0);
   updateOverlayVisibility();
 }})();
 
-async function printWaybill(mode, btn) {{
+async function printWaybill(mode, btn, download = false) {{
   const originalLabel = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Формирую PDF...';
@@ -1916,7 +2045,20 @@ async function printWaybill(mode, btn) {{
     }}
     const blob = await resp.blob();
     const url  = URL.createObjectURL(blob);
-    window.open(url, '_blank');
+    const disposition = resp.headers.get('Content-Disposition') || '';
+    const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const filename = match ? decodeURIComponent(match[1]) : 'waybill.pdf';
+    if (download) {{
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }} else {{
+      window.open(url, '_blank');
+    }}
     btn.textContent = originalLabel;
     btn.disabled = false;
   }} catch(e) {{
