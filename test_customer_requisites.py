@@ -12,6 +12,26 @@ def response(data):
 
 
 class CustomerRequisitesTests(unittest.TestCase):
+    def setUp(self):
+        config = patch.object(app, 'ORG_REQUISITES', '')
+        config.start()
+        self.addCleanup(config.stop)
+
+    def test_open_old_waybill_refreshes_customer_and_uses_local_company(self):
+        old = {'id': 'test', 'pl_number': 'test', 'fields': {'customer': 'Краткое имя'}}
+        fresh = {**app._empty_fields(), 'customer': 'Клиент ИНН 123 КПП 456',
+                 'customer_code': 'A', 'customer_details_loaded': True}
+        with patch.object(app, 'ORG_REQUISITES', 'Своя организация ИНН 789'), \
+                patch.object(app, 'waybills', {'test': old}), \
+                patch.object(app, 'fetch_order_by_pl', return_value=(fresh, None)) as fetch, \
+                patch.object(app, '_save_state'), \
+                patch.object(app, '_render_waybill', return_value='ok'):
+            asyncio.run(app.waybill_page('test'))
+            asyncio.run(app.waybill_page('test'))
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn('ИНН 123', old['fields']['customer'])
+        self.assertIn('ИНН 789', old['fields']['company_name'])
+
     def test_order_uses_details_by_exact_code_and_keeps_short_filename(self):
         order = {'КлиентКод': 'БУ-010986', 'КлиентНаименование': 'КЛИЕНТ ООО', 'Дата': '2026-09-04'}
         details = [{'code': 'БУ-010986', 'ПредставлениеПокупателя': 'ООО КЛИЕНТ, ИНН 123, КПП 456, адрес'}]

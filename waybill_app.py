@@ -61,6 +61,7 @@ WEB_PORT = 8765
 API_BASE = os.environ.get("API_BASE", "http://77.51.227.6:80/buh30_upr/hs/api")
 API_USER = os.environ.get("API_USER", "")
 API_PASS = os.environ.get("API_PASS", "")
+ORG_REQUISITES = os.environ.get("ORG_REQUISITES", "").strip()
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
@@ -188,7 +189,7 @@ def _effective_ins(field: str):
         x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
         if field == "company_name":
             x0 = 103  # Начало линии реквизитов после подписи «Организация».
-        return (x0 + x1) / 2, (126 if field == "customer" else y1 - 18)
+        return (x0 + x1) / 2, (124 if field == "customer" else y1 - 18)
     if field in _field_overrides:
         return _field_overrides[field]
     coords = SCAN_FIELDS.get(field)
@@ -1136,8 +1137,8 @@ def _organization_lines(text: str) -> list[str]:
 
 def _empty_fields() -> dict:
     fields = {
-        "organization":  "",
-        "company_name":  "",
+        "organization":  ORG_REQUISITES,
+        "company_name":  ORG_REQUISITES,
         "org_okpo":      "",
         "customer_short_name": "",
         "customer_code": "",
@@ -1231,6 +1232,15 @@ async def waybill_page(job_id: str):
     w = waybills.get(job_id)
     if not w:
         raise HTTPException(status_code=404, detail="Путевой не найден")
+    fields = w.setdefault("fields", {})
+    if not fields.get("customer_details_loaded") and w.get("pl_number"):
+        try:
+            await refresh_requisites(job_id)
+        except HTTPException as exc:
+            w["warning"] = f"Не удалось обновить реквизиты заказчика: {exc.detail}"
+    if not fields.get("company_name"):
+        fields["company_name"] = ORG_REQUISITES or fields.get("organization", "")
+    _save_state()
     return HTMLResponse(content=_render_waybill(w))
 
 
@@ -1541,7 +1551,7 @@ async def refresh_requisites(job_id: str):
     for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
         fields[key] = fresh[key]
     if not fields.get("company_name_manual"):
-        fields["company_name"] = ""  # Старое фиксированное значение не подтверждено 1С.
+        fields["company_name"] = ORG_REQUISITES or fields.get("organization", "")
     w["warning"] = warning
     _save_state()
     return {"ok": True}
@@ -1716,8 +1726,6 @@ def _render_waybill(w: dict) -> str:
 
     # Поля которые уже заполнены на скане — не дозаполняем из 1С, не перезаписываем
     def fval(key):
-        if key == "company_name" and not f.get("company_name_manual"):
-            return ""  # Не переносим фиксированную организацию из старых записей.
         return "" if fos.get(key) else f.get(key, "")
 
     # Live-превью поверх скана: позиция каждого поля в % от картинки —
@@ -1785,7 +1793,7 @@ def _render_waybill(w: dict) -> str:
     day_rows_html = "".join(day_row(i) for i in range(1, 4))
 
     fields_html = scan_summary + sec("Основные реквизиты") + "".join([
-        fld("company_name", "Организация — реквизиты вручную", badge=""),
+        fld("company_name", "Организация — проверьте реквизиты", badge="сохранено / настройки"),
         fld("work_date",   "Дата составления"),
         fld("period_from", "Период работы — с"),
         fld("period_to",   "Период работы — по"),
@@ -1808,7 +1816,8 @@ def _render_waybill(w: dict) -> str:
 
     fields_html += (
         '<p style="font-size:12px;color:#666">Заказчик загружается по коду клиента из 1С. '
-        'Организация пока вводится вручную: API её не передаёт.</p>'
+        'Организация берётся из настройки ORG_REQUISITES или сохранённых реквизитов; '
+        'её можно исправить вручную. API организацию пока не передаёт.</p>'
         '<button type="button" onclick="refreshRequisites(this)">↻ Обновить реквизиты заказчика из 1С</button>'
         '<p style="font-size:12px;color:#666">Обновление перезагрузит страницу. '
         'Несохранённые изменения формы будут потеряны.</p>'
