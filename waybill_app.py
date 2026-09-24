@@ -283,6 +283,20 @@ def _auth_headers() -> dict:
     return {"Authorization": f"Basic {token}"}
 
 
+def fetch_customer_details(code: str) -> dict:
+    """Сервис чтения карточки 1С принимает POST с кодом в query-параметре."""
+    resp = requests.post(f"{API_BASE.rstrip('/')}/kocode", params={"code": code},
+                         headers=_auth_headers(), timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not isinstance(data, list):
+        raise ValueError("Некорректный ответ сервиса реквизитов")
+    matches = [item for item in data if isinstance(item, dict) and item.get("code") == code]
+    if len(matches) != 1 or not str(matches[0].get("ПредставлениеПокупателя") or "").strip():
+        raise ValueError("Не найдены однозначные полные реквизиты по коду клиента")
+    return matches[0]
+
+
 def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
     """
     Получить данные смены/заказа из 1С по штрихкоду путевого листа
@@ -333,6 +347,8 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
 
     fields.update({
         "customer":      rec.get("КлиентНаименование", ""),
+        "customer_short_name": rec.get("КлиентНаименование", ""),
+        "customer_code": str(rec.get("КлиентКод") or "").strip(),
         "driver_name":   rec.get("ВодительНаименование", ""),
         "vehicle_type":  rec.get("МашинаНаименование", ""),
         "work_object":   rec.get("ОбъектРаботНаименование", ""),
@@ -344,7 +360,19 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
         "order_status":  rec.get("СтатусЗаказа", ""),
         "shift_status":  rec.get("СтатусСмены", ""),
     })
-    return fields, warning
+    notices = [warning] if warning else []
+    if fields["customer_code"]:
+        try:
+            details = fetch_customer_details(fields["customer_code"])
+            fields["customer"] = str(details["ПредставлениеПокупателя"]).strip()
+            fields["customer_details_loaded"] = True
+        except (requests.RequestException, ValueError) as exc:
+            log.warning("Реквизиты клиента не получены: %s", type(exc).__name__)
+            notices.append("Полные реквизиты заказчика не получены. Показано краткое наименование; проверьте перед печатью.")
+    else:
+        notices.append("1С не передала код клиента. Показано краткое наименование заказчика.")
+    notices.append("API пока не передаёт организацию-исполнителя. Заполните её реквизиты вручную, если их нет на скане.")
+    return fields, " ".join(notices)
 
 
 def save_to_1c(pl_number: str, fields: dict) -> None:
@@ -373,10 +401,6 @@ _FONT   = "C:\\Windows\\Fonts\\arial.ttf"
 _FSIZE  = 9   # кегль основного текста
 
 # Захардкоженные значения (одинаковы для всех путевых)
-ORG_NAME = ('ООО "СПЕЦСТРОЙМЕХАНИЗАЦИЯ" ИНН 7734422140, КПП 774301001\n'
-            '125493, г.Москва, вн.тер.г. Муниципальный округ Головинский, '
-            'ул.Смолная, д.2, пом.7Н/3, тел.:+7(499)399-31-65, 8(495)748-19-74')
-ORG_OKPO = "51716881"
 _ORG_FSIZE = 8   # шрифт для реквизита организации
 
 _P1_FIELDS = {
@@ -981,11 +1005,10 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         else:
             ins(eff[0], eff[1], val)
 
-    # Организация — захардкоженный реквизит, печатается всегда (не зависит от fields),
-    # если строка на скане ещё не заполнена. Две строки в зоне "company_name".
+    # Организацию берём только из формы, без подстановки констант.
     if not filled_on_scan.get("company_name"):
         cx0, cy0, cx1, cy1 = SCAN_FIELDS["company_name"][:4]
-        org_lines = ORG_NAME.split("\n")
+        org_lines = _organization_lines(str(fields.get("company_name") or ""))
         for i, line in enumerate(org_lines[:2]):
             if line.strip():
                 ins_centered("company_name", line, cy1 - 18 + i * 11, _ORG_FSIZE)
@@ -1102,10 +1125,23 @@ def _handle_new_scan(file_path: str):
     log.info("  Браузер открыт: %s", url)
 
 
+def _organization_lines(text: str) -> list[str]:
+    text = ' '.join(text.split())
+    spaces = [i for i, char in enumerate(text) if char == ' ']
+    if not spaces:
+        return [text] if text else []
+    split = min(spaces, key=lambda i: abs(i - len(text) / 2))
+    return [text[:split], text[split + 1:]]
+
+
 def _empty_fields() -> dict:
     fields = {
-        "organization":  ORG_NAME,
-        "org_okpo":      ORG_OKPO,
+        "organization":  "",
+        "company_name":  "",
+        "org_okpo":      "",
+        "customer_short_name": "",
+        "customer_code": "",
+        "customer_details_loaded": False,
         "customer":      "",
         "driver_name":   "",
         "driver_id":     "",
@@ -1462,7 +1498,7 @@ def _pdf_filename(value: str, fallback: str = "Путевой") -> str:
 
 def _default_pdf_name(w: dict) -> str:
     fields = w.get("fields", {})
-    customer = str(fields.get("customer") or "").strip()
+    customer = str(fields.get("customer_short_name") or fields.get("customer") or "").strip()
     date = str(fields.get("work_date") or fields.get("api_work_date") or w.get("filename_date") or "").strip()
     # В старых записях дата терялась после отправки пустого поля «на скане».
     if not date and w.get("pl_number"):
@@ -1488,6 +1524,29 @@ def _default_pdf_name(w: dict) -> str:
                          f"PL_{w.get('pl_number') or w['id']}")[:-4]
 
 
+@app.post("/refresh-requisites/{job_id}")
+async def refresh_requisites(job_id: str):
+    w = waybills.get(job_id)
+    if not w:
+        raise HTTPException(status_code=404)
+    if not w.get("pl_number"):
+        raise HTTPException(status_code=400, detail="Нет штрихкода для поиска в 1С")
+    try:
+        fresh, warning = fetch_order_by_pl(w["pl_number"])
+    except (requests.RequestException, ValueError):
+        raise HTTPException(status_code=502, detail="Не удалось получить реквизиты из 1С")
+    if not fresh.get("customer_code") and not fresh.get("customer"):
+        raise HTTPException(status_code=400, detail=warning or "Заказчик не найден в 1С")
+    fields = w.setdefault("fields", {})
+    for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
+        fields[key] = fresh[key]
+    if not fields.get("company_name_manual"):
+        fields["company_name"] = ""  # Старое фиксированное значение не подтверждено 1С.
+    w["warning"] = warning
+    _save_state()
+    return {"ok": True}
+
+
 @app.post("/print/{job_id}")
 async def print_waybill(job_id: str, request: Request):
     """Принять заполненные поля, сгенерировать PDF и вернуть его браузеру."""
@@ -1501,6 +1560,8 @@ async def print_waybill(job_id: str, request: Request):
     ):
         raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
     fields    = dict(form)
+    if fields.get("company_name"):
+        fields["company_name_manual"] = True
     print_mode = fields.pop("print_mode", "copy")
     if print_mode not in ("copy", "additions"):
         raise HTTPException(status_code=400, detail="Неизвестный режим печати")
@@ -1655,6 +1716,8 @@ def _render_waybill(w: dict) -> str:
 
     # Поля которые уже заполнены на скане — не дозаполняем из 1С, не перезаписываем
     def fval(key):
+        if key == "company_name" and not f.get("company_name_manual"):
+            return ""  # Не переносим фиксированную организацию из старых записей.
         return "" if fos.get(key) else f.get(key, "")
 
     # Live-превью поверх скана: позиция каждого поля в % от картинки —
@@ -1722,7 +1785,7 @@ def _render_waybill(w: dict) -> str:
     day_rows_html = "".join(day_row(i) for i in range(1, 4))
 
     fields_html = scan_summary + sec("Основные реквизиты") + "".join([
-        _field_html("company_name", "Организация", ORG_NAME.replace("\n", " "), locked=True),
+        fld("company_name", "Организация — реквизиты вручную", badge=""),
         fld("work_date",   "Дата составления"),
         fld("period_from", "Период работы — с"),
         fld("period_to",   "Период работы — по"),
@@ -1743,6 +1806,13 @@ def _render_waybill(w: dict) -> str:
         'КОРСТРОЙ ООО 48 ед 04,09. Расширение .pdf добавляется автоматически.</p>'
     )
 
+    fields_html += (
+        '<p style="font-size:12px;color:#666">Заказчик загружается по коду клиента из 1С. '
+        'Организация пока вводится вручную: API её не передаёт.</p>'
+        '<button type="button" onclick="refreshRequisites(this)">↻ Обновить реквизиты заказчика из 1С</button>'
+        '<p style="font-size:12px;color:#666">Обновление перезагрузит страницу. '
+        'Несохранённые изменения формы будут потеряны.</p>'
+    )
     btn_html = """
     <button type="button" onclick="printWaybill('copy', this)"
       style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
@@ -1972,9 +2042,19 @@ switchPage(0);
     if (!input) return;
     function sync() {{
       if (label.classList.contains('centered-label')) {{
-        var text = field === 'company_name' ? {json.dumps(ORG_NAME, ensure_ascii=True)} : input.value;
+        var text = input.value;
+        var lines = [text];
+        if (field === 'company_name') {{
+          text = text.trim().split(/\s+/).join(' ');
+          var spaces = [];
+          for (var i = 0; i < text.length; i++) if (text[i] === ' ') spaces.push(i);
+          if (spaces.length) {{
+            var middle = spaces.reduce((a, b) => Math.abs(a - text.length / 2) <= Math.abs(b - text.length / 2) ? a : b);
+            lines = [text.slice(0, middle), text.slice(middle + 1)];
+          }} else {{ lines = [text]; }}
+        }}
         label.replaceChildren();
-        text.split('\\n').forEach(function(value) {{
+        lines.forEach(function(value) {{
           var line = document.createElement('span');
           line.textContent = value;
           label.appendChild(line);
@@ -2025,6 +2105,22 @@ switchPage(0);
   applyFontSize();
   updateOverlayVisibility();
 }})();
+
+async function refreshRequisites(btn) {{
+  btn.disabled = true;
+  const msg = document.getElementById('msg');
+  try {{
+    const response = await fetch('/refresh-requisites/{w["id"]}', {{method:'POST'}});
+    if (!response.ok) {{
+      const error = await response.json();
+      throw new Error(error.detail || 'Ошибка обновления');
+    }}
+    window.location.reload();
+  }} catch (error) {{
+    msg.style.display = 'block'; msg.className = 'err-msg'; msg.textContent = error.message;
+    btn.disabled = false;
+  }}
+}}
 
 async function printWaybill(mode, btn, download = false) {{
   const originalLabel = btn.textContent;
