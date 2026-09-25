@@ -48,7 +48,10 @@ class ShiftTimesTests(unittest.TestCase):
         self.assertEqual(fields['time_in_1'], '19:00')
 
     def test_time_picker_and_handwriting_print_protection(self):
-        self.assertIn('type="time"', app._field_html('time_out_1', 'Выезд', '09:00'))
+        control = app._field_html('time_out_1', 'Выезд', '09:00')
+        self.assertEqual(control.count('<select '), 2)
+        self.assertIn('value="09:00"', control)
+        self.assertIn('value="09" selected', control)
         fields = {'time_out_1': '09:00', 'time_in_1': '17:00'}
         filled = dict.fromkeys(app.SCAN_FIELDS, True)
         filled['time_in_1'] = False

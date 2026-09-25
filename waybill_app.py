@@ -1785,7 +1785,24 @@ def _field_html(name: str, label: str, value: str,
             value = _normalize_time(value)
         except ValueError:
             value = ''
-        extras += ' step="60"'
+        parts = value.split(':') if value else ['', '']
+        disabled = ' disabled' if on_scan else ''
+        selects = []
+        for index, (count, caption) in enumerate(((24, 'Часы'), (60, 'Минуты'))):
+            options = '<option value="">—</option>' + ''.join(
+                f'<option value="{n:02d}"' + (' selected' if parts[index] == f'{n:02d}' else '') + f'>{n:02d}</option>'
+                for n in range(count)
+            )
+            selects.append(f'<select aria-label="{html.escape(label)} — {caption}" '
+                           f'onchange="updateTimeSelection(this)"{disabled}>{options}</select>')
+        return (
+            f'<div class="field"><label>{label}{badge_html}</label>'
+            f'<div class="time-control" data-time-control="{name}">'
+            f'<input type="hidden" name="{name}" value="{html.escape(value, quote=True)}">'
+            + selects[0] + '<span class="time-separator">:</span>' + selects[1]
+            + f'<button type="button" class="time-clear" aria-label="Очистить время" '
+              f'onclick="restoreApiTime(\'{name}\', \'\')"{disabled}>×</button></div></div>'
+        )
     return f"""
     <div class="field">
       <label>{label}{badge_html}</label>
@@ -1852,7 +1869,11 @@ def _render_waybill(w: dict) -> str:
     # Сводка: сколько пустых полей обнаружено
     empty_count = sum(1 for k, v in fos.items() if not v)
     filled_count = sum(1 for k, v in fos.items() if v)
-    if fos:
+    if w.get('is_demo'):
+        scan_summary = ('<div class="demo-notice">Демонстрация на чистом бланке. '
+                        'ИИ этот пример не анализировал; все ячейки бланка пустые. '
+                        'Время взято из API для проверки интерфейса.</div>')
+    elif fos:
         scan_summary = (
             f'<div style="background:#eaf4fb;border:1px solid #aed6f1;border-radius:6px;'
             f'padding:8px 12px;margin-bottom:12px;font-size:12px;color:#1a5276">'
@@ -1870,9 +1891,9 @@ def _render_waybill(w: dict) -> str:
             badge = 'из 1С' if api_value and f.get(key) == api_value else 'вручную'
             result = fld(key, label, badge=badge)
             if api_value and not fos.get(key):
-                result += (f'<button type="button" onclick="restoreApiTime(\'{key}\', \'{html.escape(api_value, quote=True)}\')" '
-                           f'style="font-size:11px">Из 1С: {html.escape(api_value)}</button>')
-            return '<div>' + result + '</div>'
+                result += (f'<button type="button" class="time-api" onclick="restoreApiTime(\'{key}\', \'{html.escape(api_value, quote=True)}\')" '
+                           f'>Вернуть из 1С: {html.escape(api_value)}</button>')
+            return '<div class="time-field">' + result + '</div>'
         return (
             '<div class="day-row">'
             + fld(f"work_day_{i}",    f"День {i}")
@@ -1898,7 +1919,7 @@ def _render_waybill(w: dict) -> str:
     ]) + sec("Объект, выезд и возвращение в гараж (до 3 дней)") + (
         '<p style="font-size:12px;color:#666">Время на лицевой стороне: '
         'выезд — колонка 4 («Начало» из 1С), возвращение — колонка 7 («Конец»). '
-        'Время можно выбрать в поле или изменить клавиатурой. Кнопка «Из 1С» возвращает исходное значение. '
+        'Выберите часы и минуты в списках. Кнопка «Вернуть из 1С» возвращает исходное значение. '
         'Заполненные на скане поля повторно не печатаются.</p>'
     ) + day_rows_html
     if f.get('api_shift_rows'):
@@ -2016,10 +2037,22 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
 .meta{{font-size:12px;color:#999;margin-bottom:12px;border-bottom:1px solid #eee;padding-bottom:10px}}
 .field{{margin-bottom:12px}}
 .field label{{display:block;font-size:11px;font-weight:700;color:#555;margin-bottom:3px;text-transform:uppercase;letter-spacing:.4px}}
-.day-row{{display:grid;grid-template-columns:52px 1fr 62px 62px;gap:6px;margin-bottom:8px;align-items:end}}
+.day-row{{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin-bottom:14px;padding:12px;background:#f6f8fa;border:1px solid #dce3eb;border-radius:8px;align-items:start}}
 .day-row .field{{margin-bottom:0}}
-.day-row .field label{{font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.day-row .field label{{font-size:10px;white-space:normal;line-height:1.5;display:block;margin-bottom:5px}}
 .day-row .field input{{padding:6px 4px;font-size:12px}}
+.day-row > *{{min-width:0}}
+.time-control{{display:flex;align-items:center;gap:3px}}
+.day-row .time-field .field label{{min-height:30px;}}
+.time-control select{{flex:1;min-width:0;height:40px;padding:0 4px;border:1px solid #b8c6d6;border-radius:6px;background:#fff;color:#152b45;font:16px Arial,sans-serif}}
+.time-control select:focus{{outline:2px solid #2980b9;outline-offset:1px}}
+.time-separator{{font-size:18px;font-weight:700}}
+.time-clear{{border:0;background:none;color:#6c757d;font-size:20px;cursor:pointer;padding:0 2px}}
+.time-api{{display:block;width:100%;min-height:32px;margin-top:8px;padding:6px 8px;background:#e8f2ff;border:1px solid #9bbfe8;border-radius:6px;color:#175c9d;font-size:11px;font-weight:600;cursor:pointer;text-align:center}}
+.time-api:hover{{background:#d6e9ff;border-color:#4389cf;}}
+.time-api:active{{background:#c2ddfa;}}
+.time-api:focus-visible{{outline:2px solid #2980b9;outline-offset:2px;}}
+.demo-notice{{background:#fff3cd;border:1px solid #e0c36d;border-radius:6px;padding:10px;font-size:12px;margin-bottom:12px}}
 .from1c{{background:#d4edda;color:#155724;border-radius:3px;padding:1px 5px;font-size:10px;text-transform:none;font-weight:400;letter-spacing:0}}
 .badge-fixed{{background:#e8e8e8;color:#555;border-radius:3px;padding:1px 5px;font-size:10px;text-transform:none;font-weight:400;letter-spacing:0}}
 .badge-scan{{background:#cfe2ff;color:#0a58ca;border-radius:3px;padding:1px 5px;font-size:10px;text-transform:none;font-weight:400;letter-spacing:0}}
@@ -2094,7 +2127,24 @@ var PAGE_W = {disp_w or 0};
 function restoreApiTime(name, value) {{
   const input = document.querySelector('#frm input[name="' + name + '"]');
   input.value = value;
+  syncTimeSelection(input);
   input.dispatchEvent(new Event('input', {{bubbles: true}}));
+}}
+
+function syncTimeSelection(input) {{
+  const control = input.closest('[data-time-control]');
+  if (!control) return;
+  const parts = input.value ? input.value.split(':') : ['', ''];
+  control.querySelectorAll('select').forEach((select, i) => select.value = parts[i] || '');
+}}
+
+function updateTimeSelection(select) {{
+  const control = select.closest('[data-time-control]');
+  const parts = control.querySelectorAll('select');
+  const input = control.querySelector('input');
+  if (select === parts[0] && parts[0].value !== '' && parts[1].value === '') parts[1].value = '00';
+  input.value = parts[0].value !== '' && parts[1].value !== '' ? parts[0].value + ':' + parts[1].value : '';
+  input.dispatchEvent(new Event('input', {{bubbles:true}}));
 }}
 
 function updateOverlayVisibility() {{
