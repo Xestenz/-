@@ -298,6 +298,47 @@ def fetch_customer_details(code: str) -> dict:
     return matches[0]
 
 
+def _normalize_time(value) -> str:
+    text = str(value if value is not None else '').strip()
+    if not text:
+        return ''
+    match = re.fullmatch(r'(\d{1,2})(?::(\d{2})(?::00)?)?', text)
+    if not match:
+        raise ValueError('Время должно быть ЧЧ:ММ')
+    hour, minute = int(match[1]), int(match[2] or 0)
+    if hour > 23 or minute > 59:
+        raise ValueError('Время вне диапазона 00:00–23:59')
+    return f'{hour:02d}:{minute:02d}'
+
+
+def _merge_shift_times(fields: dict, rows: list[dict]) -> None:
+    """Привязываем время к дню строки, сохраняя ручные значения оператора."""
+    defaults = {}
+    reserved = {str(fields.get(f'work_day_{i}') or '').strip().lstrip('0') for i in range(1, 4)} - {''}
+    used = set()
+    for i in range(1, 4):
+        day = str(fields.get(f'work_day_{i}') or '').strip().lstrip('0')
+        candidates = [(n, row) for n, row in enumerate(rows) if n not in used
+                      and (row['day'].lstrip('0') == day if day else row['day'].lstrip('0') not in reserved)]
+        if not candidates or (day and len(candidates) != 1):
+            continue
+        n, row = candidates[0]
+        used.add(n)
+        for key, value in ((f'work_day_{i}', row['day']), (f'work_object_{i}', row['object'])):
+            if not fields.get(key):
+                fields[key] = value
+        for prefix, source in (('time_out', 'start'), ('time_in', 'end')):
+            key = f'{prefix}_{i}'
+            defaults[key] = row[source]
+            if key not in fields.get('manual_time_fields', []) and (
+                not fields.get(key) or fields.get(key) == fields.get('api_time_defaults', {}).get(key)
+            ):
+                fields[key] = row[source]
+    fields['api_time_defaults'] = defaults
+    fields['api_shift_rows'] = rows
+    fields['api_time_version'] = 1
+
+
 def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
     """
     Получить данные смены/заказа из 1С по штрихкоду путевого листа
@@ -328,10 +369,11 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
     if not records:
         return fields, f"Заказ по штрихкоду {pl_number} не найден в 1С — заполните поля вручную"
 
+    records = sorted(records, key=lambda record: str(record.get('Дата') or ''))
     warning = None
     if len(records) > 1:
-        warning = (f"По штрихкоду {pl_number} найдено {len(records)} записей в 1С, "
-                    "использована первая — проверьте данные вручную")
+        warning = (f"В 1С найдено {len(records)} смен. Данные распределены по датам; "
+                   "проверьте совпадение дней со строками скана. Форма вмещает 3 строки.")
 
     rec = records[0]
 
@@ -362,6 +404,24 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
         "shift_status":  rec.get("СтатусСмены", ""),
     })
     notices = [warning] if warning else []
+    shift_rows = []
+    for record in records:
+        try:
+            shift_date = datetime.fromisoformat(str(record.get('Дата') or ''))
+        except ValueError:
+            notices.append('У смены нет корректной даты; её время автоматически не подставлено.')
+            continue
+        row = {'date': shift_date.strftime('%d.%m.%Y'), 'day': shift_date.strftime('%d'),
+               'object': record.get('ОбъектРаботНаименование') or '',
+               'quantity': record.get('Количество'), 'employee_quantity': record.get('КоличествоСотр')}
+        for target, source in (('start', 'Начало'), ('end', 'Конец')):
+            try:
+                row[target] = _normalize_time(record.get(source))
+            except ValueError:
+                row[target] = ''
+                notices.append(f"Некорректное время «{source}» за {row['date']}; укажите вручную.")
+        shift_rows.append(row)
+    _merge_shift_times(fields, shift_rows)
     if fields["customer_code"]:
         try:
             details = fetch_customer_details(fields["customer_code"])
@@ -1233,7 +1293,7 @@ async def waybill_page(job_id: str):
     if not w:
         raise HTTPException(status_code=404, detail="Путевой не найден")
     fields = w.setdefault("fields", {})
-    if not fields.get("customer_details_loaded") and w.get("pl_number"):
+    if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1) and w.get("pl_number"):
         try:
             await refresh_requisites(job_id)
         except HTTPException as exc:
@@ -1550,6 +1610,7 @@ async def refresh_requisites(job_id: str):
     fields = w.setdefault("fields", {})
     for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
         fields[key] = fresh[key]
+    _merge_shift_times(fields, fresh.get('api_shift_rows', []))
     if not fields.get("company_name_manual"):
         fields["company_name"] = ORG_REQUISITES or fields.get("organization", "")
     w["warning"] = warning
@@ -1570,6 +1631,21 @@ async def print_waybill(job_id: str, request: Request):
     ):
         raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
     fields    = dict(form)
+    manual_times = set(w.get('fields', {}).get('manual_time_fields', []))
+    for i in range(1, 4):
+        for prefix in ('time_out', 'time_in'):
+            key = f'{prefix}_{i}'
+            if w.get('filled_on_scan', {}).get(key):
+                continue
+            try:
+                fields[key] = _normalize_time(fields.get(key))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f'Строка {i}: {exc}')
+            if fields[key] != w.get('fields', {}).get('api_time_defaults', {}).get(key, ''):
+                manual_times.add(key)
+            else:
+                manual_times.discard(key)
+    fields['manual_time_fields'] = sorted(manual_times)
     if fields.get("company_name"):
         fields["company_name_manual"] = True
     print_mode = fields.pop("print_mode", "copy")
@@ -1703,10 +1779,17 @@ def _field_html(name: str, label: str, value: str,
         border = "border-color:#e74c3c" if not value.strip() else "border-color:#27ae60"
         extras = ""
         badge_html = ""
+    input_type = 'time' if name.startswith(('time_out_', 'time_in_')) else 'text'
+    if input_type == 'time':
+        try:
+            value = _normalize_time(value)
+        except ValueError:
+            value = ''
+        extras += ' step="60"'
     return f"""
     <div class="field">
       <label>{label}{badge_html}</label>
-      <input type="text" name="{name}" value="{html.escape(value)}" {extras}
+      <input type="{input_type}" name="{name}" value="{html.escape(value)}" {extras}
              style="{border};width:100%;padding:8px 10px;border:2px solid;border-radius:5px;font-size:14px;box-sizing:border-box">
     </div>"""
 
@@ -1781,12 +1864,21 @@ def _render_waybill(w: dict) -> str:
         scan_summary = '<div style="color:#aaa;font-size:12px;margin-bottom:10px">Анализ скана не выполнен</div>'
 
     def day_row(i):
+        def time_field(prefix, label):
+            key = f'{prefix}_{i}'
+            api_value = f.get('api_time_defaults', {}).get(key, '')
+            badge = 'из 1С' if api_value and f.get(key) == api_value else 'вручную'
+            result = fld(key, label, badge=badge)
+            if api_value and not fos.get(key):
+                result += (f'<button type="button" onclick="restoreApiTime(\'{key}\', \'{html.escape(api_value, quote=True)}\')" '
+                           f'style="font-size:11px">Из 1С: {html.escape(api_value)}</button>')
+            return '<div>' + result + '</div>'
         return (
             '<div class="day-row">'
             + fld(f"work_day_{i}",    f"День {i}")
             + fld(f"work_object_{i}", "Объект")
-            + fld(f"time_out_{i}",    "Выезд")
-            + fld(f"time_in_{i}",     "Возврат")
+            + time_field('time_out', 'Выезд из гаража')
+            + time_field('time_in', 'Возвращение в гараж')
             + '</div>'
         )
 
@@ -1803,7 +1895,20 @@ def _render_waybill(w: dict) -> str:
         fld("vehicle_plate", "Гос. номер"),
         fld("driver_name",   "Машинист (ФИО)"),
         fld("driver_id",     "Табельный №"),
-    ]) + sec("Объект и время работы (до 3 дней)") + day_rows_html
+    ]) + sec("Объект, выезд и возвращение в гараж (до 3 дней)") + (
+        '<p style="font-size:12px;color:#666">Время на лицевой стороне: '
+        'выезд — колонка 4 («Начало» из 1С), возвращение — колонка 7 («Конец»). '
+        'Время можно выбрать в поле или изменить клавиатурой. Кнопка «Из 1С» возвращает исходное значение. '
+        'Заполненные на скане поля повторно не печатаются.</p>'
+    ) + day_rows_html
+    if f.get('api_shift_rows'):
+        fields_html += '<details style="font-size:12px"><summary>Смены из 1С: даты, время и количество</summary>'
+        for row in f['api_shift_rows']:
+            fields_html += '<p>' + html.escape(
+                f"{row['date']}: {row['start'] or '—'}–{row['end'] or '—'}; "
+                f"Количество: {row.get('quantity')}; КоличествоСотр: {row.get('employee_quantity')}"
+            ) + '</p>'
+        fields_html += '<p>Количество и КоличествоСотр показаны как переданы в API; на оборот не печатаются.</p></details>'
     fields_html += sec("Сохранение PDF") + (
         '<label for="output-filename">Имя файла (можно изменить)</label>'
         f'<input id="output-filename" name="output_filename" '
@@ -1986,6 +2091,12 @@ var currentPage = 0;
 var markupOn = false;
 var PAGE_W = {disp_w or 0};
 
+function restoreApiTime(name, value) {{
+  const input = document.querySelector('#frm input[name="' + name + '"]');
+  input.value = value;
+  input.dispatchEvent(new Event('input', {{bubbles: true}}));
+}}
+
 function updateOverlayVisibility() {{
   var show = currentPage === 0 && !markupOn;
   document.querySelectorAll('.live-label').forEach(function(l) {{ l.style.display = show ? '' : 'none'; }});
@@ -2074,6 +2185,7 @@ switchPage(0);
       updateOverlayVisibility();
     }}
     input.addEventListener('input', sync);
+    input.addEventListener('change', sync);
     sync();
   }});
 
