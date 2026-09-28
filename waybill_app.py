@@ -953,8 +953,53 @@ def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) 
     return result
 
 
+def _resolve_reverse_row(row):
+    result = {'date': str(row.get('date') or '').strip(),
+              'hours_note': str(row.get('hours_note') or '')[:200], 'confident': False,
+              'raw_start': str(row.get('start') or ''), 'raw_end': str(row.get('end') or ''),
+              'calculation': ''}
+    date_ok = row.get('date_confident') is True
+    try:
+        fmt = '%d.%m.%Y' if len(result['date'].split('.')) == 3 else '%d.%m'
+        result['date'] = datetime.strptime(result['date'], fmt).strftime(fmt)
+    except ValueError:
+        date_ok = False
+    trusted = {}
+    for key in ('start', 'end'):
+        try:
+            value = _normalize_time(row.get(key))
+        except ValueError:
+            value = ''
+        if value and value[-2:] not in ('00', '30'):
+            value = ''
+        result[key] = value
+        trusted[key] = bool(value) and row.get(key + '_confident') is True
+    note = result['hours_note'].replace(' ', '').replace(',', '.')
+    duration = None
+    if row.get('hours_confident') is True and re.fullmatch(r'\d+(?:\.\d+)?(?:\+\d+(?:\.\d+)?)*', note):
+        minutes = sum(float(part) * 60 for part in note.split('+'))
+        if 0 < minutes < 1440 and minutes % 30 == 0:
+            duration = int(minutes)
+    def minutes(value):
+        h, m = map(int, value.split(':'))
+        return h * 60 + m
+    if trusted['start'] and trusted['end']:
+        if duration is not None and (minutes(result['end']) - minutes(result['start'])) % 1440 != duration:
+            result['calculation'] = 'Время и часы противоречат друг другу — проверьте вручную.'
+            return result
+        result['confident'] = date_ok
+    elif duration is not None and (trusted['start'] or trusted['end']):
+        target = 'end' if trusted['start'] else 'start'
+        source = 'start' if target == 'end' else 'end'
+        value = (minutes(result[source]) + (duration if target == 'end' else -duration)) % 1440
+        result[target] = f'{value // 60:02d}:{value % 60:02d}'
+        result['calculation'] = ('Окончание' if target == 'end' else 'Начало') + f' вычислено по времени {result[source]} и часам {result["hours_note"]}.'
+        result['confident'] = date_ok
+    return result
+
+
 def read_reverse_times(file_path: str) -> list[dict]:
-    """Read explicit work intervals from page two; never calculate lunch hours."""
+    """Read observations, then validate or reconstruct times using trusted hours."""
     with fitz.open(file_path) as doc:
         if len(doc) < 2:
             return []
@@ -968,10 +1013,14 @@ def read_reverse_times(file_path: str) -> list[dict]:
         'Это оборот путевого листа. Прочитай строки таблицы работы машиниста. '
         'Ответь JSON {"rows":[{"date":"ДД.ММ.ГГГГ или ДД.ММ", "start":"ЧЧ:ММ", '
         '"end":"ЧЧ:ММ", "hours_note":"дословная запись часов, например 7+1", '
-        '"confident":true}]}. Прочитай фактическое начало и окончание работы, '
+        '"date_confident":true,"start_confident":true,"end_confident":true,"hours_confident":true}]}. '
+        'Оцени уверенность отдельно для даты, начала, окончания и часов. '
+        'Допустимые минуты времени только 00 или 30; если видится 17:02, не исправляй догадкой, '
+        'верни прочитанное и end_confident:false. '
+        'Прочитай фактическое начало и окончание работы, '
         'не показания спидометра. Не вычисляй окончание по часам, не добавляй обед. '
         'Не выдумывай дату или год. Если дата или время неразборчивы, верни пустую '
-        'строку для них и confident:false. Для нескольких интервалов одной даты '
+        'строку для них и соответствующий флаг уверенности false. Для нескольких интервалов одной даты '
         'верни отдельные строки. Никаких пояснений вне JSON.'
     )
     response = requests.post(AI_BASE_URL, headers={'Authorization': f'Bearer {AI_API_KEY}'},
@@ -986,19 +1035,7 @@ def read_reverse_times(file_path: str) -> list[dict]:
     rows = json.loads(raw)['rows']
     if not isinstance(rows, list) or len(rows) > 50:
         raise ValueError('Некорректный ответ анализа оборота')
-    cleaned = []
-    for row in rows:
-        date = str(row.get('date') or '').strip()
-        try:
-            date_format = '%d.%m.%Y' if len(date.split('.')) == 3 else '%d.%m'
-            date = datetime.strptime(date, date_format).strftime(date_format)
-            start, end = _normalize_time(row.get('start')), _normalize_time(row.get('end'))
-            confident = row.get('confident') is True and bool(start and end)
-        except ValueError:
-            start, end, confident = '', '', False
-        cleaned.append({'date': date, 'start': start, 'end': end,
-                        'hours_note': str(row.get('hours_note') or '')[:200], 'confident': confident})
-    return cleaned
+    return [_resolve_reverse_row(row) for row in rows]
 
 
 def _reverse_match(fields: dict, rows: list, index: int, require_confident=True):
@@ -1016,6 +1053,7 @@ def _reverse_match(fields: dict, rows: list, index: int, require_confident=True)
 
 def _apply_reverse_times(w):
     fields = w.setdefault('fields', {})
+    previous = fields.get('reverse_time_defaults', {})
     defaults = {}
     for i in range(1, 4):
         row = _reverse_match(fields, w.get('reverse_times', []), i)
@@ -1027,6 +1065,9 @@ def _apply_reverse_times(w):
                 defaults[key] = row[source]
                 if key not in fields.get('manual_time_fields', []) and not w.get('filled_on_scan', {}).get(key):
                     fields[key] = row[source]
+    for key, value in previous.items():
+        if key not in defaults and key not in fields.get('manual_time_fields', []) and fields.get(key) == value:
+            fields[key] = fields.get('api_time_defaults', {}).get(key, '')
     fields['reverse_time_defaults'] = defaults
 
 
@@ -2112,6 +2153,7 @@ def _render_waybill(w: dict) -> str:
             reverse_html = ('<div style="grid-column:1/-1;font-size:12px;color:#805000">'
                 + html.escape(f"Оборот {reverse['date']}: {reverse['start']}–{reverse['end']}; часы: {reverse['hours_note'] or '—'}. ")
                 + html.escape(f"В 1С: {f.get('api_time_defaults', {}).get(f'time_out_{i}') or '—'}–{f.get('api_time_defaults', {}).get(f'time_in_{i}') or '—'}. ")
+                + html.escape(reverse.get('calculation', '') + ' ')
                 + ('Уверенно прочитанное время используется автоматически; ручные правки сохранены.' if reverse['confident'] else 'ИИ не уверен: проверьте запись перед переносом.')
                 + (f'<button type="button" class="time-api" onclick="{actions}">Взять время с оборота</button>' if actions else '') + '</div>')
         return (
@@ -2156,6 +2198,7 @@ def _render_waybill(w: dict) -> str:
         fields_html += '<p>Количество и КоличествоСотр показаны как переданы в API; на оборот не печатаются.</p></details>'
     fields_html += '<details><summary>Время на обороте — результат чтения</summary>'
     for row in w.get('reverse_times', []):
+        fields_html += '<p>' + html.escape(row.get('calculation', '')) + '</p>'
         fields_html += '<p>' + html.escape(f"{row['date'] or 'Дата не прочитана'}: {row['start'] or '?'}–{row['end'] or '?'}, часы: {row['hours_note']}; " + ('прочитано, сопоставление по дате' if row['confident'] else 'нужна ручная проверка')) + '</p>'
     fields_html += html.escape(w.get('reverse_warning', '')) + '</details>'
     fields_html += ('<button type="button" onclick="readReverse(this)">Прочитать время на обороте</button>'

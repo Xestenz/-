@@ -6,6 +6,25 @@ import waybill_app as app
 
 
 class ReverseTimesTests(unittest.TestCase):
+    def test_reconstruct_and_validate_time(self):
+        row = {'date': '18.07', 'date_confident': True, 'start': '09:00',
+               'start_confident': True, 'end': '17:02', 'end_confident': False,
+               'hours_note': '7+1', 'hours_confident': True}
+        resolved = app._resolve_reverse_row(row)
+        self.assertEqual(resolved['end'], '17:00')
+        self.assertTrue(resolved['confident'])
+        backward = app._resolve_reverse_row({**row, 'start': '', 'start_confident': False,
+                                             'end': '17:30', 'end_confident': True})
+        self.assertEqual(backward['start'], '09:30')
+        self.assertTrue(backward['confident'])
+        conflict = app._resolve_reverse_row({**row, 'end': '18:00', 'end_confident': True})
+        self.assertFalse(conflict['confident'])
+        self.assertEqual(conflict['end'], '18:00')
+        uncertain = app._resolve_reverse_row({**row, 'hours_confident': False})
+        self.assertFalse(uncertain['confident'])
+        self.assertEqual(uncertain['end'], '')
+        self.assertFalse(app._resolve_reverse_row({**row, 'date_confident': False})['confident'])
+
     def test_confident_reverse_overrides_api_but_not_manual_or_handwriting(self):
         w = {'fields': {'work_day_1': '24', 'api_shift_rows': [{'day': '24', 'date': '24.09.2026'}],
                         'time_in_1': '16:00'}, 'reverse_times': [
