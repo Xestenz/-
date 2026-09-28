@@ -958,12 +958,16 @@ def _resolve_reverse_row(row):
               'hours_note': str(row.get('hours_note') or '')[:200], 'confident': False,
               'raw_start': str(row.get('start') or ''), 'raw_end': str(row.get('end') or ''),
               'calculation': ''}
+    result['confidence'] = {key: row.get(key + '_confident') is True for key in ('date', 'start', 'end', 'hours')}
+    result['reasons'] = []
     date_ok = row.get('date_confident') is True
     try:
         fmt = '%d.%m.%Y' if len(result['date'].split('.')) == 3 else '%d.%m'
         result['date'] = datetime.strptime(result['date'], fmt).strftime(fmt)
     except ValueError:
         date_ok = False
+    if not date_ok:
+        result['reasons'].append('Дата прочитана неуверенно или некорректна.')
     trusted = {}
     for key in ('start', 'end'):
         try:
@@ -971,6 +975,7 @@ def _resolve_reverse_row(row):
         except ValueError:
             value = ''
         if value and value[-2:] not in ('00', '30'):
+            result['reasons'].append(f'{"Начало" if key == "start" else "Окончание"}: прочитано {value}, допустимы минуты только 00 или 30.')
             value = ''
         result[key] = value
         trusted[key] = bool(value) and row.get(key + '_confident') is True
@@ -986,6 +991,7 @@ def _resolve_reverse_row(row):
     if trusted['start'] and trusted['end']:
         if duration is not None and (minutes(result['end']) - minutes(result['start'])) % 1440 != duration:
             result['calculation'] = 'Время и часы противоречат друг другу — проверьте вручную.'
+            result['reasons'].append(result['calculation'])
             return result
         result['confident'] = date_ok
     elif duration is not None and (trusted['start'] or trusted['end']):
@@ -995,6 +1001,13 @@ def _resolve_reverse_row(row):
         result[target] = f'{value // 60:02d}:{value % 60:02d}'
         result['calculation'] = ('Окончание' if target == 'end' else 'Начало') + f' вычислено по времени {result[source]} и часам {result["hours_note"]}.'
         result['confident'] = date_ok
+    else:
+        if not trusted['start']:
+            result['reasons'].append('Начало работы прочитано неуверенно или отсутствует.')
+        if not trusted['end']:
+            result['reasons'].append('Окончание работы прочитано неуверенно или отсутствует.')
+        if duration is None:
+            result['reasons'].append('Часы прочитаны неуверенно или запись часов не распознана как число/сумма.')
     return result
 
 
@@ -1009,6 +1022,17 @@ def read_reverse_times(file_path: str) -> list[dict]:
             matrix = matrix.prerotate(90)
         pix = page.get_pixmap(matrix=matrix)
         encoded = base64.b64encode(pix.tobytes('png')).decode()
+        source = Image.open(io.BytesIO(pix.tobytes('png')))
+        crops = []
+        for label, bounds in (
+            ('Дата и начало/окончание работы, колонки 1–2', (0, .08, .15, .37)),
+            ('Отработано часов, колонка 7, вместе с соседними границами', (.38, .08, .50, .37)),
+        ):
+            box = tuple(int(value * (source.width if i % 2 == 0 else source.height)) for i, value in enumerate(bounds))
+            buf = io.BytesIO()
+            source.crop(box).save(buf, format='PNG')
+            crops.extend([{'type': 'text', 'text': label}, {'type': 'image_url', 'image_url': {
+                'url': 'data:image/png;base64,' + base64.b64encode(buf.getvalue()).decode()}}])
     prompt = (
         'Это оборот путевого листа. Прочитай строки таблицы работы машиниста. '
         'Ответь JSON {"rows":[{"date":"ДД.ММ.ГГГГ или ДД.ММ", "start":"ЧЧ:ММ", '
@@ -1018,6 +1042,9 @@ def read_reverse_times(file_path: str) -> list[dict]:
         'Допустимые минуты времени только 00 или 30; если видится 17:02, не исправляй догадкой, '
         'верни прочитанное и end_confident:false. '
         'Прочитай фактическое начало и окончание работы, '
+        'После полной страницы даны увеличенные фрагменты даты/времени и часов. '
+        'Сверяй их с полной страницей: границы вырезки могут не совпасть с таблицей. '
+        'Особенно внимательно различай рукописные месяцы 04 и 07; если неясно, date_confident:false. '
         'не показания спидометра. Не вычисляй окончание по часам, не добавляй обед. '
         'Не выдумывай дату или год. Если дата или время неразборчивы, верни пустую '
         'строку для них и соответствующий флаг уверенности false. Для нескольких интервалов одной даты '
@@ -1027,7 +1054,7 @@ def read_reverse_times(file_path: str) -> list[dict]:
         json={'model': AI_MODEL, 'max_tokens': 1600, 'messages': [{'role': 'user', 'content': [
             {'type': 'text', 'text': prompt},
             {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}
-        ]}]}, timeout=90)
+        ] + crops}]}, timeout=90)
     response.raise_for_status()
     raw = response.json()['choices'][0]['message']['content'].strip()
     if raw.startswith('```'):
@@ -2199,6 +2226,17 @@ def _render_waybill(w: dict) -> str:
     fields_html += '<details><summary>Время на обороте — результат чтения</summary>'
     for row in w.get('reverse_times', []):
         fields_html += '<p>' + html.escape(row.get('calculation', '')) + '</p>'
+        reasons = list(row.get('reasons', []))
+        api_dates = {r.get('date', '') for r in f.get('api_shift_rows', [])}
+        if not any(row.get('date') in (date, date[:5]) for date in api_dates):
+            reasons.append('Дата оборота ' + (row.get('date') or 'не прочитана') + ' не совпадает с датами 1С: ' + ', '.join(sorted(api_dates)) + '. Автоперенос отключён.')
+        elif not any(_reverse_match(f, w.get('reverse_times', []), i, require_confident=False) == row for i in range(1, 4)):
+            reasons.append('Не удалось однозначно сопоставить строку по дате: проверьте дни и повторяющиеся записи.')
+        if row.get('confidence'):
+            captions = {'date': 'Дата', 'start': 'Начало', 'end': 'Окончание', 'hours': 'Часы'}
+            fields_html += '<p>' + html.escape('; '.join(captions[k] + ': ' + ('уверенно' if value else 'неуверенно') for k, value in row['confidence'].items())) + '</p>'
+        for reason in reasons:
+            fields_html += '<p style="color:#805000">' + html.escape(reason) + '</p>'
         fields_html += '<p>' + html.escape(f"{row['date'] or 'Дата не прочитана'}: {row['start'] or '?'}–{row['end'] or '?'}, часы: {row['hours_note']}; " + ('прочитано, сопоставление по дате' if row['confident'] else 'нужна ручная проверка')) + '</p>'
     fields_html += html.escape(w.get('reverse_warning', '')) + '</details>'
     fields_html += ('<button type="button" onclick="readReverse(this)">Прочитать время на обороте</button>'
