@@ -376,6 +376,12 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
                    "проверьте совпадение дней со строками скана. Форма вмещает 3 строки.")
 
     rec = records[0]
+    supplier = str(rec.get("ПредставлениеПоставщика") or "").strip()
+    fields['api_company_name'] = supplier
+    fields['api_company_version'] = 1
+    if supplier:
+        fields['company_name'] = supplier
+        fields['organization'] = supplier
 
     work_date = fields["work_date"]
     work_day_1 = ""
@@ -432,7 +438,8 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
             notices.append("Полные реквизиты заказчика не получены. Показано краткое наименование; проверьте перед печатью.")
     else:
         notices.append("1С не передала код клиента. Показано краткое наименование заказчика.")
-    notices.append("API пока не передаёт организацию-исполнителя. Заполните её реквизиты вручную, если их нет на скане.")
+    if not supplier:
+        notices.append("1С не передала реквизиты организации для этого путевого. Использованы местные настройки, если они заданы; проверьте организацию.")
     return fields, " ".join(notices)
 
 
@@ -775,7 +782,7 @@ _AI_FIELD_DESCRIPTIONS = """\
 - time_in_1..3: время возвращения в гараж в строке 1–3"""
 
 
-def detect_fields_with_ai(file_path: str) -> dict:
+def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) -> dict:
     """
     Определяет заполненные/пустые поля скана через vision-модель.
     Гибридный подход: целая страница (контекст + широкие поля) + увеличенные
@@ -829,6 +836,9 @@ def detect_fields_with_ai(file_path: str) -> dict:
             y0 = min(b[1] for b in boxes)
             x1 = max(b[2] for b in boxes)
             y1 = max(b[3] for b in boxes)
+            if label == 'table_block':
+                y0 = 205  # Include column headings and numbers above the three rows.
+                x1 = max(x1, 540)  # Complete return heading and adjacent signature columns.
             sx0, sy0, sx1, sy1 = _tmpl_region_to_scan(x0, y0, x1, y1, pw, ph)
             pad = 10
             box = (
@@ -849,9 +859,12 @@ def detect_fields_with_ai(file_path: str) -> dict:
             _make_crop(group_name, fields_in_group)
         for field in _CROP_STANDALONE:
             _make_crop(field, [field])
+        for field in SCAN_FIELDS:
+            if field.startswith(('time_out_', 'time_in_')):
+                _make_crop(field, [field])
 
         field_names = list(SCAN_FIELDS.keys())
-        schema_hint = ", ".join(f'"{f}": true/false' for f in field_names)
+        schema_hint = ", ".join(f'"{f}": ' + ('true/false/null' if f.startswith(('time_out_', 'time_in_')) else 'true/false') for f in field_names)
 
         prompt_text = (
             "Это скан рукописного путевого листа ЭСМ-2 (строительная машина). "
@@ -865,6 +878,15 @@ def detect_fields_with_ai(file_path: str) -> dict:
             "сверху вниз (число/объект/выезд/возврат в каждой) — ориентируйся "
             "на видимые линии сетки, чтобы не перепутать соседние строки. "
             "date_block — 3 квадратика даты подряд. period_block — поля «с»/«по» рядом.\n"
+            "Блок таблицы включает заголовки: выезд — колонка 4, возвращение — колонка 7. "
+            "Дополнительно даны отдельные увеличенные ячейки time_out_1..3 и time_in_1..3. "
+            "Сопоставляй их с общим блоком и границами строк. Подпись механика в соседней "
+            "колонке и её росчерк, заходящий через границу, НЕ являются временем. "
+            "Для времени true означает запись времени именно внутри нужной ячейки; "
+            "false — пустую ячейку, в том числе с однозначно чужим росчерком. "
+            "Если неясно, собственная ли это запись или чужой росчерк, либо вырезка "
+            "смещена и нельзя уверенно определить ячейку, верни null для этого времени. "
+            "Не угадывай заполненность по наличию любого штриха.\n"
             "Ответь СТРОГО валидным JSON без пояснений и markdown-разметки, "
             f"со всеми перечисленными ключами: {{{schema_hint}}}"
         )
@@ -910,11 +932,15 @@ def detect_fields_with_ai(file_path: str) -> dict:
         ai_result = json.loads(text)
 
         if not isinstance(ai_result, dict) or any(
-            type(ai_result.get(field)) is not bool for field in field_names
+            field not in ai_result or (type(ai_result[field]) is not bool and not (
+                field.startswith(('time_out_', 'time_in_')) and ai_result[field] is None
+            )) for field in field_names
         ):
             raise ValueError("AI вернул неполный или некорректный анализ полей")
         for field in field_names:
-            result[field] = ai_result[field]
+            result[field] = ai_result[field] is not False
+            if ai_result[field] is None and review_fields is not None:
+                review_fields.append(field)
         log.info("Детектирование (AI+crop) %s: %s", Path(file_path).name, result)
     except Exception as exc:
         if USE_PIXEL_FALLBACK:
@@ -925,6 +951,110 @@ def detect_fields_with_ai(file_path: str) -> dict:
             f"AI-анализ не выполнен ({AI_PROVIDER}); пиксельный fallback отключён"
         ) from exc
     return result
+
+
+def read_reverse_times(file_path: str) -> list[dict]:
+    """Read explicit work intervals from page two; never calculate lunch hours."""
+    with fitz.open(file_path) as doc:
+        if len(doc) < 2:
+            return []
+        page = doc[1]
+        matrix = fitz.Matrix(3, 3)
+        if page.rect.height > page.rect.width:
+            matrix = matrix.prerotate(90)
+        pix = page.get_pixmap(matrix=matrix)
+        encoded = base64.b64encode(pix.tobytes('png')).decode()
+    prompt = (
+        'Это оборот путевого листа. Прочитай строки таблицы работы машиниста. '
+        'Ответь JSON {"rows":[{"date":"ДД.ММ.ГГГГ или ДД.ММ", "start":"ЧЧ:ММ", '
+        '"end":"ЧЧ:ММ", "hours_note":"дословная запись часов, например 7+1", '
+        '"confident":true}]}. Прочитай фактическое начало и окончание работы, '
+        'не показания спидометра. Не вычисляй окончание по часам, не добавляй обед. '
+        'Не выдумывай дату или год. Если дата или время неразборчивы, верни пустую '
+        'строку для них и confident:false. Для нескольких интервалов одной даты '
+        'верни отдельные строки. Никаких пояснений вне JSON.'
+    )
+    response = requests.post(AI_BASE_URL, headers={'Authorization': f'Bearer {AI_API_KEY}'},
+        json={'model': AI_MODEL, 'max_tokens': 1600, 'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': prompt},
+            {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}
+        ]}]}, timeout=90)
+    response.raise_for_status()
+    raw = response.json()['choices'][0]['message']['content'].strip()
+    if raw.startswith('```'):
+        raw = raw.strip('`').removeprefix('json').strip()
+    rows = json.loads(raw)['rows']
+    if not isinstance(rows, list) or len(rows) > 50:
+        raise ValueError('Некорректный ответ анализа оборота')
+    cleaned = []
+    for row in rows:
+        date = str(row.get('date') or '').strip()
+        try:
+            date_format = '%d.%m.%Y' if len(date.split('.')) == 3 else '%d.%m'
+            date = datetime.strptime(date, date_format).strftime(date_format)
+            start, end = _normalize_time(row.get('start')), _normalize_time(row.get('end'))
+            confident = row.get('confident') is True and bool(start and end)
+        except ValueError:
+            start, end, confident = '', '', False
+        cleaned.append({'date': date, 'start': start, 'end': end,
+                        'hours_note': str(row.get('hours_note') or '')[:200], 'confident': confident})
+    return cleaned
+
+
+def _reverse_match(fields: dict, rows: list, index: int, require_confident=True):
+    day = str(fields.get(f'work_day_{index}') or '').lstrip('0')
+    shifts = [r for r in fields.get('api_shift_rows', []) if str(r.get('day', '')).lstrip('0') == day]
+    dates = {r['date'] for r in shifts}
+    if len(dates) != 1:
+        return None
+    date = next(iter(dates))
+    matches = [r for r in rows if r.get('date') in (date, date[:5])]
+    if len(matches) != 1 or (require_confident and not matches[0].get('confident')):
+        return None
+    return matches[0]
+
+
+def _apply_reverse_times(w):
+    fields = w.setdefault('fields', {})
+    defaults = {}
+    for i in range(1, 4):
+        row = _reverse_match(fields, w.get('reverse_times', []), i)
+        if not row:
+            continue
+        for prefix, source in (('time_out', 'start'), ('time_in', 'end')):
+            key = f'{prefix}_{i}'
+            if row.get(source):
+                defaults[key] = row[source]
+                if key not in fields.get('manual_time_fields', []) and not w.get('filled_on_scan', {}).get(key):
+                    fields[key] = row[source]
+    fields['reverse_time_defaults'] = defaults
+
+
+def _fit_object_text(text: str, width: float, height: float):
+    """Wrap at words (or characters for long tokens), then shrink to cell bounds."""
+    font = fitz.Font(fontfile=_FONT)
+    text = ' '.join(text.split())
+    size = 9.0
+    while True:
+        lines, line = [], ''
+        for word in text.split():
+            candidate = (line + ' ' + word).strip()
+            if font.text_length(candidate, fontsize=size) <= width:
+                line = candidate
+                continue
+            if line:
+                lines.append(line)
+            line = ''
+            for char in word:
+                if line and font.text_length(line + char, fontsize=size) > width:
+                    lines.append(line)
+                    line = ''
+                line += char
+        if line:
+            lines.append(line)
+        if len(lines) * size * 1.2 <= height:
+            return lines, size
+        size *= 0.95
 
 
 def fill_scan_pdf(scan_path: str, fields: dict, filled_on_scan: dict, *, additions_only: bool = False) -> bytes:
@@ -1060,6 +1190,14 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         if field == "customer":
             ins_centered(field, val, eff[1], _FSIZE)
             continue
+        if field.startswith('work_object_'):
+            x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
+            lines, size = _fit_object_text(val, x1 - x0 - 4, y1 - y0 - 4)
+            display_w, _ = _disp_dims(sw, sh)
+            for i, line in enumerate(lines):
+                xp, yp = _tmpl_to_scan_pt(x0 + 2, y0 + 2 + size + i * size * 1.2, sw, sh)
+                ins_scan(xp, yp, line, size * display_w / _TMPL_W)
+            continue
         override = _pct_override(field)
         if override:
             ins_scan(override[0], override[1], val)
@@ -1146,13 +1284,14 @@ def _handle_new_scan(file_path: str):
         "error":          None,
         "warning":        None,
         "detection_warning": None,
+        "review_fields": [],
     }
     waybills[job_id] = entry
 
     # Определяем заполненные поля на скане (до запроса 1С)
     try:
         entry["filled_on_scan"] = (
-            detect_fields_with_ai(file_path) if USE_AI_DETECTION
+            detect_fields_with_ai(file_path, entry['review_fields']) if USE_AI_DETECTION
             else detect_filled_fields(file_path)
         )
     except Exception as exc:
@@ -1178,6 +1317,13 @@ def _handle_new_scan(file_path: str):
         log.warning("  Штрихкод не найден — оператор заполнит вручную")
         entry["fields"] = _empty_fields()
 
+    _save_state()
+
+    try:
+        entry['reverse_times'] = read_reverse_times(file_path)
+        _apply_reverse_times(entry)
+    except Exception:
+        entry['reverse_warning'] = 'Не удалось прочитать оборот. Время из 1С оставлено без изменений.'
     _save_state()
 
     # Открываем браузер
@@ -1293,13 +1439,14 @@ async def waybill_page(job_id: str):
     if not w:
         raise HTTPException(status_code=404, detail="Путевой не найден")
     fields = w.setdefault("fields", {})
-    if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1) and w.get("pl_number"):
+    if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1 or fields.get('api_company_version') != 1) and w.get("pl_number"):
         try:
             await refresh_requisites(job_id)
         except HTTPException as exc:
             w["warning"] = f"Не удалось обновить реквизиты заказчика: {exc.detail}"
     if not fields.get("company_name"):
         fields["company_name"] = ORG_REQUISITES or fields.get("organization", "")
+    _apply_reverse_times(w)
     _save_state()
     return HTMLResponse(content=_render_waybill(w))
 
@@ -1594,6 +1741,21 @@ def _default_pdf_name(w: dict) -> str:
                          f"PL_{w.get('pl_number') or w['id']}")[:-4]
 
 
+@app.post('/read-reverse/{job_id}')
+async def read_reverse(job_id: str):
+    w = waybills.get(job_id)
+    if not w:
+        raise HTTPException(status_code=404)
+    try:
+        w['reverse_times'] = read_reverse_times(w['file_path'])
+        _apply_reverse_times(w)
+        w.pop('reverse_warning', None)
+    except Exception:
+        raise HTTPException(status_code=502, detail='Не удалось прочитать оборот; повторите позже.')
+    _save_state()
+    return {'ok': True}
+
+
 @app.post("/refresh-requisites/{job_id}")
 async def refresh_requisites(job_id: str):
     w = waybills.get(job_id)
@@ -1611,8 +1773,13 @@ async def refresh_requisites(job_id: str):
     for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
         fields[key] = fresh[key]
     _merge_shift_times(fields, fresh.get('api_shift_rows', []))
+    _apply_reverse_times(w)
+    fields['api_company_name'] = fresh.get('api_company_name', '')
+    fields['api_company_version'] = fresh.get('api_company_version', 1)
     if not fields.get("company_name_manual"):
-        fields["company_name"] = ORG_REQUISITES or fields.get("organization", "")
+        fields["company_name"] = fields['api_company_name'] or ORG_REQUISITES or fields.get("organization", "")
+    if fields['api_company_name']:
+        fields['organization'] = fields['api_company_name']
     w["warning"] = warning
     _save_state()
     return {"ok": True}
@@ -1631,23 +1798,35 @@ async def print_waybill(job_id: str, request: Request):
     ):
         raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
     fields    = dict(form)
+    for key in w.get('review_fields', []):
+        if fields.pop('scan_review_' + key, '') != '1':
+            raise HTTPException(status_code=400, detail="Проверьте сомнительные ячейки времени и отметьте «Я проверил ячейку» перед печатью.")
+    filled_on_scan = dict(w['filled_on_scan'])
+    for key in SCAN_FIELDS:
+        if fields.pop('scan_override_' + key, '') == '1':
+            filled_on_scan[key] = fields.pop('scan_empty_' + key, '') != '1'
+            if key == 'work_date':
+                for part in ('work_date_2', 'work_date_3'):
+                    filled_on_scan[part] = filled_on_scan[key]
     manual_times = set(w.get('fields', {}).get('manual_time_fields', []))
     for i in range(1, 4):
         for prefix in ('time_out', 'time_in'):
             key = f'{prefix}_{i}'
-            if w.get('filled_on_scan', {}).get(key):
+            if filled_on_scan.get(key):
                 continue
             try:
                 fields[key] = _normalize_time(fields.get(key))
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=f'Строка {i}: {exc}')
-            if fields[key] != w.get('fields', {}).get('api_time_defaults', {}).get(key, ''):
+            defaults = w.get('fields', {}).get('reverse_time_defaults', {})
+            expected = defaults.get(key, w.get('fields', {}).get('api_time_defaults', {}).get(key, ''))
+            if fields[key] != expected:
                 manual_times.add(key)
             else:
                 manual_times.discard(key)
     fields['manual_time_fields'] = sorted(manual_times)
     if fields.get("company_name"):
-        fields["company_name_manual"] = True
+        fields["company_name_manual"] = fields['company_name'] != w.get('fields', {}).get('api_company_name', '')
     print_mode = fields.pop("print_mode", "copy")
     if print_mode not in ("copy", "additions"):
         raise HTTPException(status_code=400, detail="Неизвестный режим печати")
@@ -1661,7 +1840,13 @@ async def print_waybill(job_id: str, request: Request):
     w["filename_date"] = name_entry.get("filename_date") or name_fields.get("work_date") or w.get("filename_date", "")
     if print_mode == "additions":
         filename = _pdf_filename(filename[:-4] + " — допечатка")
+    # Keep API/manual values when the operator marks a cell as already filled.
+    for key in SCAN_FIELDS:
+        if filled_on_scan.get(key):
+            fields[key] = w.get('fields', {}).get(key, '')
     w["fields"] = {**w.get("fields", {}), **fields}
+    w['filled_on_scan'] = filled_on_scan
+    w['review_fields'] = []
     log.info("Путевой %s — режим печати: %s", pl_number, print_mode)
 
     try:
@@ -1837,9 +2022,17 @@ def _render_waybill(w: dict) -> str:
     overlay_labels = []
     overlay_hidden = []
     for field, (dleft, dtop) in default_pos.items():
+        if field.startswith('work_object_') and disp_w and _disp_h:
+            x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
+            xp, yp = _tmpl_to_scan_pt(x0 + 2, y0 + 2, _raw_sw, _raw_sh)
+            xd, yd = _raw_to_disp_pt(xp, yp, _raw_sw, _raw_sh)
+            overlay_labels.append(
+                f'<span class="live-label object-label" data-field="{field}" '
+                f'data-cell-width="{x1-x0-4}" data-cell-height="{y1-y0-4}" '
+                f'style="left:{xd / disp_w * 100}%;top:{yd / _disp_h * 100}%"></span>'
+            )
+            continue
         if field in ("customer", "company_name"):
-            if fos.get(field):
-                continue
             x0, _, x1, _ = SCAN_FIELDS[field][:4]
             if field == "company_name":
                 x0 = 103
@@ -1863,8 +2056,24 @@ def _render_waybill(w: dict) -> str:
     overlay_hidden_html = "".join(overlay_hidden)
 
     def fld(name, label, badge="из 1С", **kw):
-        return _field_html(name, label, fval(name), badge=badge,
-                           on_scan=fos.get(name, False), **kw)
+        on_scan = fos.get(name, False)
+        if name == 'work_date':
+            on_scan = any(fos.get(k) for k in ('work_date', 'work_date_2', 'work_date_3'))
+        value = f.get(name, '')
+        if on_scan and not value:
+            value = f.get('api_time_defaults', {}).get(name, '')
+        control = _field_html(name, label, '' if on_scan else value, badge=badge,
+                              on_scan=on_scan, **kw)
+        if name in w.get('review_fields', []):
+            control = control.replace('на скане ✏', 'нужно проверить')
+            control += (f'<label class="scan-choice"><input type="checkbox" name="scan_review_{name}" value="1">'
+                        'Я проверил ячейку</label><small>ИИ не уверен. Если ячейка пустая, включите печать ниже.</small>')
+        checked = '' if on_scan else ' checked'
+        return (f'<div class="scan-field" data-name="{name}" '
+                f'data-value="{html.escape(str(value), quote=True)}">' + control
+                + f'<input type="hidden" name="scan_override_{name}" value="1">'
+                + f'<label class="scan-choice"><input type="checkbox" name="scan_empty_{name}" '
+                  f'value="1"{checked} onchange="toggleScanField(this)"> Поле пустое — печатать</label></div>')
 
     # Сводка: сколько пустых полей обнаружено
     empty_count = sum(1 for k, v in fos.items() if not v)
@@ -1889,24 +2098,37 @@ def _render_waybill(w: dict) -> str:
             key = f'{prefix}_{i}'
             api_value = f.get('api_time_defaults', {}).get(key, '')
             badge = 'из 1С' if api_value and f.get(key) == api_value else 'вручную'
+            if f.get('reverse_time_defaults', {}).get(key) and f.get(key) == f['reverse_time_defaults'][key]:
+                badge = 'с оборота'
             result = fld(key, label, badge=badge)
-            if api_value and not fos.get(key):
+            if api_value:
                 result += (f'<button type="button" class="time-api" onclick="restoreApiTime(\'{key}\', \'{html.escape(api_value, quote=True)}\')" '
                            f'>Вернуть из 1С: {html.escape(api_value)}</button>')
             return '<div class="time-field">' + result + '</div>'
+        reverse = _reverse_match(f, w.get('reverse_times', []), i, require_confident=False)
+        reverse_html = ''
+        if reverse:
+            actions = ';'.join(f"restoreApiTime('{key}_{i}', '{reverse[value]}')" for key, value in [('time_out', 'start'), ('time_in', 'end')] if reverse.get(value) and not fos.get(f'{key}_{i}'))
+            reverse_html = ('<div style="grid-column:1/-1;font-size:12px;color:#805000">'
+                + html.escape(f"Оборот {reverse['date']}: {reverse['start']}–{reverse['end']}; часы: {reverse['hours_note'] or '—'}. ")
+                + html.escape(f"В 1С: {f.get('api_time_defaults', {}).get(f'time_out_{i}') or '—'}–{f.get('api_time_defaults', {}).get(f'time_in_{i}') or '—'}. ")
+                + ('Уверенно прочитанное время используется автоматически; ручные правки сохранены.' if reverse['confident'] else 'ИИ не уверен: проверьте запись перед переносом.')
+                + (f'<button type="button" class="time-api" onclick="{actions}">Взять время с оборота</button>' if actions else '') + '</div>')
         return (
             '<div class="day-row">'
             + fld(f"work_day_{i}",    f"День {i}")
             + fld(f"work_object_{i}", "Объект")
             + time_field('time_out', 'Выезд из гаража')
             + time_field('time_in', 'Возвращение в гараж')
+            + reverse_html
             + '</div>'
         )
 
     day_rows_html = "".join(day_row(i) for i in range(1, 4))
 
     fields_html = scan_summary + sec("Основные реквизиты") + "".join([
-        fld("company_name", "Организация — проверьте реквизиты", badge="сохранено / настройки"),
+        fld("company_name", "Организация — проверьте реквизиты", badge="из 1С" if f.get('api_company_name') and f.get('company_name') == f.get('api_company_name') else "сохранено / настройки")
+        + (f'<button type="button" class="time-api" onclick="restoreApiTime(\'company_name\', {html.escape(json.dumps(f["api_company_name"]), quote=True)})">Вернуть организацию из 1С</button>' if f.get('api_company_name') else ''),
         fld("work_date",   "Дата составления"),
         fld("period_from", "Период работы — с"),
         fld("period_to",   "Период работы — по"),
@@ -1920,7 +2142,9 @@ def _render_waybill(w: dict) -> str:
         '<p style="font-size:12px;color:#666">Время на лицевой стороне: '
         'выезд — колонка 4 («Начало» из 1С), возвращение — колонка 7 («Конец»). '
         'Выберите часы и минуты в списках. Кнопка «Вернуть из 1С» возвращает исходное значение. '
-        'Заполненные на скане поля повторно не печатаются.</p>'
+        'Заполненные на скане поля повторно не печатаются. Если ИИ ошибся, включите '
+        '«Поле пустое — печатать» под нужным полем. Снимите флажок, если поле уже заполнено. '
+        'Выбор сохраняется при сохранении PDF или печати.</p>'
     ) + day_rows_html
     if f.get('api_shift_rows'):
         fields_html += '<details style="font-size:12px"><summary>Смены из 1С: даты, время и количество</summary>'
@@ -1930,6 +2154,13 @@ def _render_waybill(w: dict) -> str:
                 f"Количество: {row.get('quantity')}; КоличествоСотр: {row.get('employee_quantity')}"
             ) + '</p>'
         fields_html += '<p>Количество и КоличествоСотр показаны как переданы в API; на оборот не печатаются.</p></details>'
+    fields_html += '<details><summary>Время на обороте — результат чтения</summary>'
+    for row in w.get('reverse_times', []):
+        fields_html += '<p>' + html.escape(f"{row['date'] or 'Дата не прочитана'}: {row['start'] or '?'}–{row['end'] or '?'}, часы: {row['hours_note']}; " + ('прочитано, сопоставление по дате' if row['confident'] else 'нужна ручная проверка')) + '</p>'
+    fields_html += html.escape(w.get('reverse_warning', '')) + '</details>'
+    fields_html += ('<button type="button" onclick="readReverse(this)">Прочитать время на обороте</button>'
+                    '<p style="font-size:11px">Чтение перезагрузит страницу; несохранённые правки будут потеряны. '
+                    'Если дата не сопоставлена однозначно, время переносится только вручную.</p>')
     fields_html += sec("Сохранение PDF") + (
         '<label for="output-filename">Имя файла (можно изменить)</label>'
         f'<input id="output-filename" name="output_filename" '
@@ -1942,9 +2173,9 @@ def _render_waybill(w: dict) -> str:
 
     fields_html += (
         '<p style="font-size:12px;color:#666">Заказчик загружается по коду клиента из 1С. '
-        'Организация берётся из настройки ORG_REQUISITES или сохранённых реквизитов; '
-        'её можно исправить вручную. API организацию пока не передаёт.</p>'
-        '<button type="button" onclick="refreshRequisites(this)">↻ Обновить реквизиты заказчика из 1С</button>'
+        'Организация загружается из поля ПредставлениеПоставщика в 1С. '
+        'Если реквизиты не переданы, используются местные настройки. Ручные изменения сохраняются.</p>'
+        '<button type="button" onclick="refreshRequisites(this)">↻ Обновить реквизиты из 1С</button>'
         '<p style="font-size:12px;color:#666">Обновление перезагрузит страницу. '
         'Несохранённые изменения формы будут потеряны.</p>'
     )
@@ -2028,6 +2259,8 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
 .live-label.dragging{{background:#ffd400}}
 .live-label.centered-label{{transform:translate(-50%,-0.9em);padding:0;font-weight:400;text-align:center;}}
 .live-label.centered-label.has-text{{cursor:default;pointer-events:none;}}
+.live-label.object-label{{transform:none;white-space:pre;padding:0;font-weight:400;font-family:Arial;}}
+.live-label.object-label.has-text{{cursor:default;pointer-events:none;}}
 .centered-label span{{display:block;}}
 #overlay-hint{{display:none;position:absolute;top:4px;left:4px;background:#000c;color:#ffd;
   font-size:11px;padding:4px 8px;border-radius:4px;z-index:5}}
@@ -2052,6 +2285,8 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
 .time-api:hover{{background:#d6e9ff;border-color:#4389cf;}}
 .time-api:active{{background:#c2ddfa;}}
 .time-api:focus-visible{{outline:2px solid #2980b9;outline-offset:2px;}}
+.scan-choice{{display:flex;align-items:center;gap:6px;margin:6px 0 10px;font-size:11px;color:#175c9d;cursor:pointer;text-transform:none!important}}
+.scan-choice input{{width:auto!important;flex:none;cursor:pointer}}
 .demo-notice{{background:#fff3cd;border:1px solid #e0c36d;border-radius:6px;padding:10px;font-size:12px;margin-bottom:12px}}
 .from1c{{background:#d4edda;color:#155724;border-radius:3px;padding:1px 5px;font-size:10px;text-transform:none;font-weight:400;letter-spacing:0}}
 .badge-fixed{{background:#e8e8e8;color:#555;border-radius:3px;padding:1px 5px;font-size:10px;text-transform:none;font-weight:400;letter-spacing:0}}
@@ -2123,9 +2358,19 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
 var currentPage = 0;
 var markupOn = false;
 var PAGE_W = {disp_w or 0};
+async function readReverse(button) {{
+  button.disabled = true; button.textContent = 'Читаем оборот…';
+  try {{
+    const response = await fetch('/read-reverse/{w["id"]}', {{method:'POST'}});
+    if (!response.ok) throw new Error('Не удалось прочитать оборот. Повторите позже.');
+    location.reload();
+  }} catch(error) {{ alert(error.message); button.disabled=false; button.textContent='Прочитать время на обороте'; }}
+}}
 
 function restoreApiTime(name, value) {{
   const input = document.querySelector('#frm input[name="' + name + '"]');
+  const checkbox = input.closest('.scan-field')?.querySelector('.scan-choice input');
+  if (checkbox && !checkbox.checked) {{ checkbox.checked = true; toggleScanField(checkbox); }}
   input.value = value;
   syncTimeSelection(input);
   input.dispatchEvent(new Event('input', {{bubbles: true}}));
@@ -2137,6 +2382,26 @@ function syncTimeSelection(input) {{
   const parts = input.value ? input.value.split(':') : ['', ''];
   control.querySelectorAll('select').forEach((select, i) => select.value = parts[i] || '');
 }}
+
+function toggleScanField(checkbox) {{
+  const wrapper = checkbox.closest('.scan-field');
+  const input = wrapper.querySelector('[name="' + wrapper.dataset.name + '"]');
+  if (!checkbox.checked) {{
+    wrapper.dataset.value = input.value || wrapper.dataset.value;
+    input.value = '';
+  }} else {{ input.value = wrapper.dataset.value || ''; }}
+  input.readOnly = !checkbox.checked;
+  wrapper.querySelectorAll('select, .time-clear').forEach(el => el.disabled = !checkbox.checked);
+  const badge = wrapper.querySelector('.badge-scan');
+  if (badge) badge.style.display = checkbox.checked ? 'none' : '';
+  syncTimeSelection(input);
+  input.dispatchEvent(new Event('input', {{bubbles:true}}));
+}}
+
+document.querySelectorAll('.scan-choice input').forEach(checkbox => {{
+  const wrapper = checkbox.closest('.scan-field');
+  wrapper.querySelector('[name="' + wrapper.dataset.name + '"]').readOnly = !checkbox.checked;
+}});
 
 function updateTimeSelection(select) {{
   const control = select.closest('[data-time-control]');
@@ -2189,6 +2454,34 @@ switchPage(0);
   function applyFontSize() {{
     var px = fontScale();
     document.querySelectorAll('.live-label').forEach(function(l) {{ l.style.fontSize = px + 'px'; }});
+    document.querySelectorAll('.object-label').forEach(function(l) {{
+      const input = document.querySelector('#frm input[name="' + l.dataset.field + '"]');
+      const text = (input?.value || '').trim().replace(/\s+/g, ' ');
+      const ctx = document.createElement('canvas').getContext('2d');
+      const width = Number(l.dataset.cellWidth), height = Number(l.dataset.cellHeight);
+      let size = 9, lines;
+      for (;;) {{
+        ctx.font = size + 'px Arial';
+        lines = []; let line = '';
+        for (const word of text.split(' ').filter(Boolean)) {{
+          const candidate = (line + ' ' + word).trim();
+          if (ctx.measureText(candidate).width <= width) {{ line = candidate; continue; }}
+          if (line) lines.push(line);
+          line = '';
+          for (const char of word) {{
+            if (line && ctx.measureText(line + char).width > width) {{ lines.push(line); line = ''; }}
+            line += char;
+          }}
+        }}
+        if (line) lines.push(line);
+        if (lines.length * size * 1.2 <= height) break;
+        size *= 0.95;
+      }}
+      const scale = img.clientWidth / {_TMPL_W};
+      l.textContent = lines.join('\\n');
+      l.style.fontSize = size * scale + 'px';
+      l.style.lineHeight = size * 1.2 * scale + 'px';
+    }});
     document.querySelectorAll('.centered-label').forEach(function(l) {{
       var scale = img.clientWidth / PAGE_W;
       var size = (l.dataset.field === 'company_name' ? 8 : 9) * scale;
@@ -2230,7 +2523,7 @@ switchPage(0);
           label.appendChild(line);
         }});
         applyFontSize();
-      }} else {{ label.textContent = input.value; }}
+      }} else {{ label.textContent = input.value; if (label.classList.contains('object-label')) applyFontSize(); }}
       label.classList.toggle('has-text', !!input.value.trim());
       updateOverlayVisibility();
     }}
@@ -2242,7 +2535,7 @@ switchPage(0);
   var dragging = null;
   document.querySelectorAll('.live-label').forEach(function(label) {{
     label.addEventListener('mousedown', function(e) {{
-      if (label.classList.contains('centered-label')) return;
+      if (label.classList.contains('centered-label') || label.classList.contains('object-label')) return;
       if (!label.classList.contains('has-text')) return;
       var rect = wrap.getBoundingClientRect();
       dragging = {{

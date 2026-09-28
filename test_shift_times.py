@@ -1,11 +1,65 @@
 import unittest
-from unittest.mock import patch, Mock
+import asyncio
+import json
+from unittest.mock import patch, Mock, AsyncMock
 
 import fitz
 import waybill_app as app
 
 
 class ShiftTimesTests(unittest.TestCase):
+    def test_long_object_address_stays_inside_cell(self):
+        font = fitz.Font(fontfile=app._FONT)
+        for text in ('г Москва, ул Суворовская, д 6 стр 14', 'ОченьДлинноеСловоБезПробелов' * 5):
+            lines, size = app._fit_object_text(text, 112, 16)
+            self.assertEqual(''.join(lines).replace(' ', ''), text.replace(' ', ''))
+            self.assertLessEqual(len(lines) * size * 1.2, 16)
+            for line in lines:
+                self.assertLessEqual(font.text_length(line, fontsize=size), 112)
+
+    def test_ai_gets_time_crops_and_flags_uncertainty(self):
+        result = dict.fromkeys(app.SCAN_FIELDS, False)
+        result['time_in_1'] = None
+        response = Mock(status_code=200)
+        response.json.return_value = {'choices': [{'message': {'content': json.dumps(result)}}]}
+        review = []
+        with patch.object(app, 'AI_API_KEY', 'test'), \
+                patch.object(app.requests, 'post', return_value=response) as post:
+            detected = app.detect_fields_with_ai(str(app.TEMPLATE_PATH), review)
+        content = post.call_args.kwargs['json']['messages'][0]['content']
+        self.assertEqual(sum(item['type'] == 'image_url' for item in content), 12)
+        self.assertEqual(review, ['time_in_1'])
+        self.assertTrue(detected['time_in_1'])
+
+    def test_uncertain_time_requires_operator_confirmation(self):
+        entry = {'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False), 'review_fields': ['time_in_1']}
+        request = Mock()
+        request.form = AsyncMock(return_value={})
+        with patch.object(app, 'waybills', {'test': entry}), patch.object(app, '_save_state') as save:
+            with self.assertRaises(app.HTTPException) as exc:
+                asyncio.run(app.print_waybill('test', request))
+        self.assertEqual(exc.exception.status_code, 400)
+        save.assert_not_called()
+
+    def test_operator_can_correct_scan_status_and_print_time(self):
+        for allow in (True, False):
+            entry = {'id': 'test', 'pl_number': 'test', 'file_path': str(app.TEMPLATE_PATH),
+                     'fields': {'time_out_1': '09:00', 'work_date': '24.09.2026'},
+                     'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, True)}
+            form = {'scan_override_time_out_1': '1', 'time_out_1': '09:00',
+                    'print_mode': 'additions'}
+            if allow:
+                form['scan_empty_time_out_1'] = '1'
+            request = Mock()
+            request.form = AsyncMock(return_value=form)
+            with patch.object(app, 'waybills', {'test': entry}), \
+                    patch.object(app, '_save_state'), patch.object(app, '_auto_calibrate'):
+                response = asyncio.run(app.print_waybill('test', request))
+            self.assertEqual(entry['filled_on_scan']['time_out_1'], not allow)
+            self.assertEqual(entry['fields']['time_out_1'], '09:00')
+            with fitz.open(stream=response.body, filetype='pdf') as doc:
+                self.assertEqual('09:00' in doc[0].get_text(), allow)
+
     def test_normalization_and_invalid_values(self):
         for value, expected in [('9', '09:00'), (0, '00:00'), ('9:15', '09:15'), ('17:30:00', '17:30'), (None, '')]:
             self.assertEqual(app._normalize_time(value), expected)

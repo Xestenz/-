@@ -44,6 +44,29 @@ class CustomerRequisitesTests(unittest.TestCase):
         self.assertEqual(app._default_pdf_name({'id': 'test', 'fields': fields}), 'КЛИЕНТ ООО 04,09')
         self.assertIn('организац', warning)
 
+    def test_supplier_from_api_overrides_local_configuration(self):
+        supplier = 'ООО "Поставщик", ИНН 123, КПП 456, Адрес, тел.: 12345'
+        with patch.object(app, 'ORG_REQUISITES', 'Local organization'), \
+                patch.object(app.requests, 'post', return_value=response([
+                    {'КлиентНаименование': 'Клиент', 'ПредставлениеПоставщика': supplier}
+                ])):
+            fields, warning = app.fetch_order_by_pl('test')
+        self.assertEqual(fields['company_name'], supplier)
+        self.assertEqual(fields['api_company_name'], supplier)
+        self.assertNotIn('не передала реквизиты организации', warning)
+
+    def test_refresh_loads_supplier_and_preserves_manual_override(self):
+        for manual in (False, True):
+            old = {'pl_number': 'test', 'fields': {'company_name': 'Old', 'company_name_manual': manual}}
+            fresh = {**app._empty_fields(), 'customer': 'Client', 'customer_code': 'A',
+                     'api_company_name': 'Supplier from API', 'api_company_version': 1}
+            with patch.object(app, 'waybills', {'test': old}), \
+                    patch.object(app, 'fetch_order_by_pl', return_value=(fresh, '')), \
+                    patch.object(app, '_save_state'):
+                asyncio.run(app.refresh_requisites('test'))
+            self.assertEqual(old['fields']['company_name'], 'Old' if manual else 'Supplier from API')
+            self.assertEqual(old['fields']['api_company_name'], 'Supplier from API')
+
     def test_wrong_customer_is_not_used(self):
         order = {'КлиентКод': 'A', 'КлиентНаименование': 'Правильный клиент'}
         with patch.object(app.requests, 'post', side_effect=[response([order]), response([
