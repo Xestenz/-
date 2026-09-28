@@ -6,6 +6,17 @@ import waybill_app as app
 
 
 class ReverseTimesTests(unittest.TestCase):
+    def test_single_shift_accepts_uncertain_date_but_not_confident_conflict(self):
+        fields = {'work_day_1': '18', 'api_shift_rows': [{'day': '18', 'date': '18.07.2026'}]}
+        row = app._resolve_reverse_row({'date': '18.04', 'date_confident': False,
+            'start': '09:00', 'start_confident': True, 'end': '17:02', 'end_confident': False,
+            'hours_note': '7+1', 'hours_confident': True})
+        self.assertEqual(app._reverse_match(fields, [row], 1)['end'], '17:00')
+        self.assertIsNone(app._reverse_match(fields, [row], 2))
+        self.assertIsNone(app._reverse_match(fields, [row, row], 1))
+        row['confidence']['date'] = True
+        self.assertIsNone(app._reverse_match(fields, [row], 1))
+
     def test_reconstruct_and_validate_time(self):
         row = {'date': '18.07', 'date_confident': True, 'start': '09:00',
                'start_confident': True, 'end': '17:02', 'end_confident': False,

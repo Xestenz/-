@@ -957,7 +957,7 @@ def _resolve_reverse_row(row):
     result = {'date': str(row.get('date') or '').strip(),
               'hours_note': str(row.get('hours_note') or '')[:200], 'confident': False,
               'raw_start': str(row.get('start') or ''), 'raw_end': str(row.get('end') or ''),
-              'calculation': ''}
+              'calculation': '', 'time_confident': False}
     result['confidence'] = {key: row.get(key + '_confident') is True for key in ('date', 'start', 'end', 'hours')}
     result['reasons'] = []
     date_ok = row.get('date_confident') is True
@@ -994,6 +994,7 @@ def _resolve_reverse_row(row):
             result['reasons'].append(result['calculation'])
             return result
         result['confident'] = date_ok
+        result['time_confident'] = True
     elif duration is not None and (trusted['start'] or trusted['end']):
         target = 'end' if trusted['start'] else 'start'
         source = 'start' if target == 'end' else 'end'
@@ -1001,6 +1002,7 @@ def _resolve_reverse_row(row):
         result[target] = f'{value // 60:02d}:{value % 60:02d}'
         result['calculation'] = ('Окончание' if target == 'end' else 'Начало') + f' вычислено по времени {result[source]} и часам {result["hours_note"]}.'
         result['confident'] = date_ok
+        result['time_confident'] = True
     else:
         if not trusted['start']:
             result['reasons'].append('Начало работы прочитано неуверенно или отсутствует.')
@@ -1067,6 +1069,19 @@ def read_reverse_times(file_path: str) -> list[dict]:
 
 def _reverse_match(fields: dict, rows: list, index: int, require_confident=True):
     day = str(fields.get(f'work_day_{index}') or '').lstrip('0')
+    api_rows = fields.get('api_shift_rows', [])
+    if len(api_rows) == 1 and len(rows) == 1:
+        shift = api_rows[0]
+        target_day = str(shift.get('day', '')).lstrip('0')
+        matching_slots = [i for i in range(1, 4) if str(fields.get(f'work_day_{i}') or '').lstrip('0') == target_day]
+        slot = matching_slots[0] if len(matching_slots) == 1 else (1 if not matching_slots and not day else None)
+        if slot == index:
+            row = rows[0]
+            date = shift.get('date', '')
+            date_confident = row.get('confidence', {}).get('date', row.get('confident', False))
+            conflict = date_confident and row.get('date') not in (date, date[:5])
+            if not conflict and (not require_confident or row.get('time_confident', row.get('confident', False))):
+                return row
     shifts = [r for r in fields.get('api_shift_rows', []) if str(r.get('day', '')).lstrip('0') == day]
     dates = {r['date'] for r in shifts}
     if len(dates) != 1:
@@ -1080,6 +1095,12 @@ def _reverse_match(fields: dict, rows: list, index: int, require_confident=True)
 
 def _apply_reverse_times(w):
     fields = w.setdefault('fields', {})
+    for row in w.get('reverse_times', []):
+        if 'time_confident' not in row and row.get('confidence'):
+            source = {**row, 'start': row.get('raw_start', row.get('start')),
+                      'end': row.get('raw_end', row.get('end'))}
+            source.update({key + '_confident': value for key, value in row['confidence'].items()})
+            row.update(_resolve_reverse_row(source))
     previous = fields.get('reverse_time_defaults', {})
     defaults = {}
     for i in range(1, 4):
@@ -2181,7 +2202,7 @@ def _render_waybill(w: dict) -> str:
                 + html.escape(f"Оборот {reverse['date']}: {reverse['start']}–{reverse['end']}; часы: {reverse['hours_note'] or '—'}. ")
                 + html.escape(f"В 1С: {f.get('api_time_defaults', {}).get(f'time_out_{i}') or '—'}–{f.get('api_time_defaults', {}).get(f'time_in_{i}') or '—'}. ")
                 + html.escape(reverse.get('calculation', '') + ' ')
-                + ('Уверенно прочитанное время используется автоматически; ручные правки сохранены.' if reverse['confident'] else 'ИИ не уверен: проверьте запись перед переносом.')
+                + ('Время с оборота используется автоматически; ручные правки сохранены.' if _reverse_match(f, w.get('reverse_times', []), i) else 'ИИ не уверен: проверьте запись перед переносом.')
                 + (f'<button type="button" class="time-api" onclick="{actions}">Взять время с оборота</button>' if actions else '') + '</div>')
         return (
             '<div class="day-row">'
@@ -2227,8 +2248,11 @@ def _render_waybill(w: dict) -> str:
     for row in w.get('reverse_times', []):
         fields_html += '<p>' + html.escape(row.get('calculation', '')) + '</p>'
         reasons = list(row.get('reasons', []))
+        auto_matched = any(_reverse_match(f, w.get('reverse_times', []), i) == row for i in range(1, 4))
         api_dates = {r.get('date', '') for r in f.get('api_shift_rows', [])}
-        if not any(row.get('date') in (date, date[:5]) for date in api_dates):
+        if auto_matched and not row.get('confident'):
+            reasons.append('Одна смена и одна строка на обороте: уверенное время сопоставлено без требования уверенной даты.')
+        elif not any(row.get('date') in (date, date[:5]) for date in api_dates):
             reasons.append('Дата оборота ' + (row.get('date') or 'не прочитана') + ' не совпадает с датами 1С: ' + ', '.join(sorted(api_dates)) + '. Автоперенос отключён.')
         elif not any(_reverse_match(f, w.get('reverse_times', []), i, require_confident=False) == row for i in range(1, 4)):
             reasons.append('Не удалось однозначно сопоставить строку по дате: проверьте дни и повторяющиеся записи.')
