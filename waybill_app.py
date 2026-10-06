@@ -10,6 +10,7 @@
 
 import base64
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pdf_archive import archive_pdf, marked_pdf, is_completed
 import html
 import io
@@ -58,6 +59,11 @@ SCAN_FOLDER   = os.environ.get("SCAN_FOLDER", r"C:\Scans")
 OUTPUT_FOLDER = os.environ.get('OUTPUT_FOLDER', str(Path(__file__).parent / 'completed'))
 OUTPUT_MIRROR_FOLDER = os.environ.get('OUTPUT_MIRROR_FOLDER', '')
 _intake_lock = threading.RLock()
+_state_lock = threading.RLock()
+SCAN_WORKERS = max(1, min(4, int(os.environ.get('SCAN_WORKERS', '2'))))
+_scan_pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix='scan')
+_queued_paths = {}
+_active_hashes = set()
 TEMPLATE_PATH = Path(__file__).parent / "template_esm2.pdf"
 
 WEB_HOST = "127.0.0.1"
@@ -134,9 +140,10 @@ _pdf_lock = threading.RLock()
 def _save_state() -> None:
     """Сохранить waybills на диск (атомарно, чтобы не повредить файл при сбое)."""
     try:
-        tmp_path = STATE_FILE.with_suffix(".json.tmp")
-        tmp_path.write_text(json.dumps(waybills, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp_path, STATE_FILE)
+        with _state_lock:
+            tmp_path = STATE_FILE.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(waybills, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp_path, STATE_FILE)
     except Exception as exc:
         log.error("Не удалось сохранить waybills_state.json: %s", exc)
 
@@ -810,63 +817,66 @@ def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) 
         raise RuntimeError(f"AI-ключ не задан для провайдера {AI_PROVIDER}; пиксельный fallback отключён")
 
     try:
-        doc_scan = pdfium.PdfDocument(file_path)
-        if len(doc_scan) == 0:
-            return result
-        page_scan = doc_scan[0]
-        pw, ph = page_scan.get_width(), page_scan.get_height()
-        portrait = _scan_is_portrait(pw, ph)
+        with _pdf_lock:
+            doc_scan = pdfium.PdfDocument(file_path)
+            if len(doc_scan) == 0:
+                return result
+            page_scan = doc_scan[0]
+            pw, ph = page_scan.get_width(), page_scan.get_height()
+            portrait = _scan_is_portrait(pw, ph)
 
-        # Целая страница — для контекста и широких полей
-        bitmap_full = page_scan.render(scale=2)
-        img_full = bitmap_full.to_pil().convert("RGB")
-        buf_full = io.BytesIO()
-        img_full.save(buf_full, format="JPEG", quality=85)
-        full_b64 = base64.b64encode(buf_full.getvalue()).decode()
+            # Целая страница — для контекста и широких полей
+            bitmap_full = page_scan.render(scale=2)
+            img_full = bitmap_full.to_pil().convert("RGB")
+            buf_full = io.BytesIO()
+            img_full.save(buf_full, format="JPEG", quality=85)
+            full_b64 = base64.b64encode(buf_full.getvalue()).decode()
 
-        # Увеличенные вырезки БЛОКАМИ полей (масштаб ×3 для чёткости) —
-        # вместо тесной вырезки каждой ячейки отдельно отдаём модели блок с
-        # видимой сеткой таблицы, чтобы она сама различала соседние строки.
-        CROP_SCALE = 3
-        bitmap_crop = page_scan.render(scale=CROP_SCALE)
-        img_crop_base = bitmap_crop.to_pil().convert("RGB")
-        crop_b64: dict[str, str] = {}      # label -> base64
-        crop_fields: dict[str, list[str]] = {}  # label -> поля внутри этого блока
+            # Увеличенные вырезки БЛОКАМИ полей (масштаб ×3 для чёткости) —
+            # вместо тесной вырезки каждой ячейки отдельно отдаём модели блок с
+            # видимой сеткой таблицы, чтобы она сама различала соседние строки.
+            CROP_SCALE = 3
+            bitmap_crop = page_scan.render(scale=CROP_SCALE)
+            img_crop_base = bitmap_crop.to_pil().convert("RGB")
+            crop_b64: dict[str, str] = {}      # label -> base64
+            crop_fields: dict[str, list[str]] = {}  # label -> поля внутри этого блока
 
-        def _make_crop(label: str, fields_in_group: list[str]) -> None:
-            boxes = [SCAN_FIELDS[f][:4] for f in fields_in_group if f in SCAN_FIELDS]
-            if not boxes:
-                return
-            x0 = min(b[0] for b in boxes)
-            y0 = min(b[1] for b in boxes)
-            x1 = max(b[2] for b in boxes)
-            y1 = max(b[3] for b in boxes)
-            if label == 'table_block':
-                y0 = 205  # Include column headings and numbers above the three rows.
-                x1 = max(x1, 540)  # Complete return heading and adjacent signature columns.
-            sx0, sy0, sx1, sy1 = _tmpl_region_to_scan(x0, y0, x1, y1, pw, ph)
-            pad = 10
-            box = (
-                max(0, int(sx0 * CROP_SCALE) - pad),
-                max(0, int(sy0 * CROP_SCALE) - pad),
-                min(img_crop_base.width,  int(sx1 * CROP_SCALE) + pad),
-                min(img_crop_base.height, int(sy1 * CROP_SCALE) + pad),
-            )
-            crop = img_crop_base.crop(box)
-            if portrait:
-                crop = crop.rotate(90, expand=True)  # 90° CCW → читается горизонтально
-            buf = io.BytesIO()
-            crop.save(buf, format="JPEG", quality=90)
-            crop_b64[label] = base64.b64encode(buf.getvalue()).decode()
-            crop_fields[label] = fields_in_group
+            def _make_crop(label: str, fields_in_group: list[str]) -> None:
+                boxes = [SCAN_FIELDS[f][:4] for f in fields_in_group if f in SCAN_FIELDS]
+                if not boxes:
+                    return
+                x0 = min(b[0] for b in boxes)
+                y0 = min(b[1] for b in boxes)
+                x1 = max(b[2] for b in boxes)
+                y1 = max(b[3] for b in boxes)
+                if label == 'table_block':
+                    y0 = 205  # Include column headings and numbers above the three rows.
+                    x1 = max(x1, 540)  # Complete return heading and adjacent signature columns.
+                sx0, sy0, sx1, sy1 = _tmpl_region_to_scan(x0, y0, x1, y1, pw, ph)
+                pad = 10
+                box = (
+                    max(0, int(sx0 * CROP_SCALE) - pad),
+                    max(0, int(sy0 * CROP_SCALE) - pad),
+                    min(img_crop_base.width,  int(sx1 * CROP_SCALE) + pad),
+                    min(img_crop_base.height, int(sy1 * CROP_SCALE) + pad),
+                )
+                crop = img_crop_base.crop(box)
+                if portrait:
+                    crop = crop.rotate(90, expand=True)  # 90° CCW → читается горизонтально
+                buf = io.BytesIO()
+                crop.save(buf, format="JPEG", quality=90)
+                crop_b64[label] = base64.b64encode(buf.getvalue()).decode()
+                crop_fields[label] = fields_in_group
 
-        for group_name, fields_in_group in _CROP_GROUPS.items():
-            _make_crop(group_name, fields_in_group)
-        for field in _CROP_STANDALONE:
-            _make_crop(field, [field])
-        for field in SCAN_FIELDS:
-            if field.startswith(('time_out_', 'time_in_')):
+            for group_name, fields_in_group in _CROP_GROUPS.items():
+                _make_crop(group_name, fields_in_group)
+            for field in _CROP_STANDALONE:
                 _make_crop(field, [field])
+            for field in SCAN_FIELDS:
+                if field.startswith(('time_out_', 'time_in_')):
+                    _make_crop(field, [field])
+            page_scan.close()
+            doc_scan.close()
 
         field_names = list(SCAN_FIELDS.keys())
         schema_hint = ", ".join(f'"{f}": ' + ('true/false/null' if f.startswith(('time_out_', 'time_in_')) else 'true/false') for f in field_names)
@@ -1020,7 +1030,7 @@ def _resolve_reverse_row(row):
 
 def read_reverse_times(file_path: str) -> list[dict]:
     """Read observations, then validate or reconstruct times using trusted hours."""
-    with fitz.open(file_path) as doc:
+    with _pdf_lock, fitz.open(file_path) as doc:
         if len(doc) < 2:
             return []
         page = doc[1]
@@ -1329,7 +1339,10 @@ def _images_from_file(file_path: str) -> list[Image.Image]:
         for i in range(len(doc)):
             page = doc[i]
             bitmap = page.render(scale=3)   # 300 dpi эквивалент
-            images.append(bitmap.to_pil())
+            images.append(bitmap.to_pil().copy())
+            bitmap.close()
+            page.close()
+        doc.close()
         return images
     return [Image.open(file_path)]
 
@@ -1337,7 +1350,9 @@ def _images_from_file(file_path: str) -> list[Image.Image]:
 def read_barcode(file_path: str) -> Optional[str]:
     """Прочитать штрихкод из файла. Возвращает полный штрихкод или None."""
     try:
-        for img in _images_from_file(file_path):
+        with _pdf_lock:
+            images = _images_from_file(file_path)
+        for img in images:
             decoded = pyzbar.decode(img)
             if decoded:
                 return decoded[0].data.decode("utf-8")
@@ -1350,6 +1365,38 @@ def read_barcode(file_path: str) -> Optional[str]:
 # Watchdog — мониторинг папки сканера
 # ---------------------------------------------------------------------------
 
+def _enqueue_scan(file_path, wait_for_file=False):
+    key = os.path.normcase(os.path.abspath(file_path))
+    with _state_lock:
+        if key in _queued_paths:
+            return
+        _queued_paths[key] = 'Ожидает обработки'
+    def run():
+        try:
+            if wait_for_file:
+                previous = None
+                stable = 0
+                for _ in range(60):
+                    stat = Path(file_path).stat()
+                    current = (stat.st_size, stat.st_mtime_ns)
+                    stable = stable + 1 if current == previous and stat.st_size else 0
+                    if stable >= 2:
+                        break
+                    previous = current
+                    time.sleep(1)
+                else:
+                    raise RuntimeError('Файл не закончил записываться за 60 секунд')
+            with _state_lock:
+                _queued_paths[key] = 'Обрабатывается'
+            _handle_new_scan(file_path)
+        except Exception:
+            log.exception('Ошибка обработки файла %s', file_path)
+        finally:
+            with _state_lock:
+                _queued_paths.pop(key, None)
+    return _scan_pool.submit(run)
+
+
 class ScanHandler(FileSystemEventHandler):
     def on_created(self, event):
         if event.is_directory:
@@ -1357,8 +1404,7 @@ class ScanHandler(FileSystemEventHandler):
         path = Path(event.src_path)
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
             return
-        time.sleep(1.5)  # дать сканеру закончить запись файла
-        _handle_new_scan(str(path))
+        _enqueue_scan(str(path), wait_for_file=True)
 
 
 def _handle_new_scan(file_path: str):
@@ -1375,7 +1421,14 @@ def _handle_new_scan(file_path: str):
                 log.info('Повторный скан: открываем существующий путевой %s', old['id'])
                 webbrowser.open(f'http://{WEB_HOST}:{WEB_PORT}/waybill/{old["id"]}')
                 return
+        if digest in _active_hashes:
+            return
+        _active_hashes.add(digest)
+    try:
         return _handle_unique_scan(file_path, digest)
+    finally:
+        with _intake_lock:
+            _active_hashes.discard(digest)
 
 
 def _handle_unique_scan(file_path: str, digest: str):
@@ -1399,45 +1452,64 @@ def _handle_unique_scan(file_path: str, digest: str):
         "detection_warning": None,
         "review_fields": [],
     }
-    waybills[job_id] = entry
+    started = time.monotonic()
+    entry['stage_seconds'] = {}
+    with _state_lock:
+        waybills[job_id] = entry
+    _save_state()
 
-    # Определяем заполненные поля на скане (до запроса 1С)
-    try:
-        entry["filled_on_scan"] = (
-            detect_fields_with_ai(file_path, entry['review_fields']) if USE_AI_DETECTION
-            else detect_filled_fields(file_path)
-        )
-    except Exception as exc:
-        entry["filled_on_scan"] = {}
-        entry["detection_warning"] = str(exc)
-        log.error("  %s", exc)
-
-    # Читаем штрихкод
-    barcode = read_barcode(file_path)
-    if barcode:
-        entry["barcode"]   = barcode
-        entry["pl_number"] = barcode    # номер путевого = весь штрихкод
-        log.info("  Штрихкод: %s", barcode)
+    def timed(name, function):
+        begin = time.monotonic()
         try:
-            entry["fields"], entry["warning"] = fetch_order_by_pl(barcode)
-            if entry["warning"]:
-                log.warning("  %s", entry["warning"])
-        except Exception as exc:
-            log.error("  Ошибка запроса 1С: %s", exc)
-            entry["error"] = str(exc)
-            entry["fields"] = _empty_fields()
-    else:
-        log.warning("  Штрихкод не найден — оператор заполнит вручную")
-        entry["fields"] = _empty_fields()
+            return function()
+        finally:
+            elapsed = round(time.monotonic() - begin, 1)
+            with _state_lock:
+                entry['stage_seconds'][name] = elapsed
+            log.info('Scan %s stage %s: %.1f sec', job_id, name, elapsed)
 
-    _save_state()
+    def order_data():
+        barcode = read_barcode(file_path)
+        with _state_lock:
+            entry['barcode'] = entry['pl_number'] = barcode
+        if not barcode:
+            return None, _empty_fields(), None
+        fields, warning = fetch_order_by_pl(barcode)
+        return barcode, fields, warning
 
-    try:
-        entry['reverse_times'] = read_reverse_times(file_path)
+    with ThreadPoolExecutor(max_workers=3) as stages:
+        tasks = {
+            stages.submit(timed, 'front', lambda: detect_fields_with_ai(file_path, entry['review_fields']) if USE_AI_DETECTION else detect_filled_fields(file_path)): 'front',
+            stages.submit(timed, 'reverse', lambda: read_reverse_times(file_path)): 'reverse',
+            stages.submit(timed, 'order', order_data): 'order',
+        }
+        for future in as_completed(tasks):
+            name = tasks[future]
+            try:
+                value = future.result()
+                with _state_lock:
+                    if name == 'front':
+                        entry['filled_on_scan'] = value
+                    elif name == 'reverse':
+                        entry['reverse_times'] = value
+                    else:
+                        entry['barcode'], entry['fields'], entry['warning'] = value
+                        entry['pl_number'] = entry['barcode']
+            except Exception as exc:
+                log.exception('Scan %s stage %s failed', job_id, name)
+                with _state_lock:
+                    if name == 'front':
+                        entry['detection_warning'] = str(exc)
+                    elif name == 'reverse':
+                        entry['reverse_warning'] = str(exc)
+                    else:
+                        entry['error'] = str(exc)
+                        entry['fields'] = _empty_fields()
+            _save_state()
+    with _state_lock:
         _apply_reverse_times(entry)
-    except Exception:
-        entry['reverse_warning'] = 'Не удалось прочитать оборот. Время из 1С оставлено без изменений.'
-    _save_state()
+        entry['processing_seconds'] = round(time.monotonic() - started, 1)
+    log.info('Scan %s ready in %.1f sec', job_id, entry['processing_seconds'])
 
     entry['processing'] = False
     _save_state()
@@ -1445,6 +1517,7 @@ def _handle_unique_scan(file_path: str, digest: str):
     url = f"http://{WEB_HOST}:{WEB_PORT}/waybill/{job_id}"
     webbrowser.open(url)
     log.info("  Браузер открыт: %s", url)
+    return entry
 
 
 def _organization_lines(text: str) -> list[str]:
@@ -1495,21 +1568,24 @@ app = FastAPI(title="Путевые листы ЭСМ-2")
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
+    with _state_lock:
+        entries = list(waybills.values())
+        queue = list(_queued_paths.items())
     pending   = sorted(
-        [w for w in waybills.values() if w["status"] == "pending"],
+        [w for w in entries if w["status"] == "pending"],
         key=lambda x: x["created_at"], reverse=True,
     )
-    confirmed = [w for w in waybills.values() if w["status"] == "confirmed"]
+    confirmed = [w for w in entries if w["status"] == "confirmed"]
 
     rows = ""
     for w in pending + confirmed:
         rows += f"""
         <tr>
-          <td><input type="checkbox" name="jobs" value="{w['id']}"></td>
+          <td><input type="checkbox" name="jobs" value="{w['id']}" {'disabled' if w.get('processing') else ''}></td>
           <td>{w['created_at'][11:19]}</td>
           <td>{w['file_name']}</td>
           <td>{w['pl_number'] or '—'}</td>
-          <td><a href="/waybill/{w['id']}">Открыть →</a> {'— сохранён' if w['status'] == 'confirmed' else ''}</td>
+          <td>{'Обрабатывается…' if w.get('processing') else '<a href="/waybill/' + w['id'] + '">Открыть →</a>'} {'— сохранён' if w['status'] == 'confirmed' else ''} {str(w['processing_seconds']) + ' сек.' if 'processing_seconds' in w else ''}</td>
         </tr>"""
     if not rows:
         rows = "<tr><td colspan='4' style='color:#999;text-align:center'>Нет ожидающих</td></tr>"
@@ -1521,6 +1597,8 @@ async def index():
         scan_folder=SCAN_FOLDER,
         output_folder=html.escape(OUTPUT_FOLDER),
         mirror_folder=html.escape(OUTPUT_MIRROR_FOLDER or 'не включено'),
+        queue_html=''.join('<li>' + html.escape(Path(path).name + ': ' + status) + '</li>' for path, status in queue),
+        has_queue='true' if queue else 'false',
     ))
 
 
@@ -1542,12 +1620,7 @@ async def upload_file(request: Request):
     save_path = save_dir / f"{uuid.uuid4().hex[:8]}_{file.filename}"
     save_path.write_bytes(await file.read())
 
-    job_id_holder = {}
-
-    def process():
-        _handle_new_scan(str(save_path))
-
-    threading.Thread(target=process, daemon=True).start()
+    _enqueue_scan(str(save_path))
     return JSONResponse({"ok": True})
 
 
@@ -1557,6 +1630,8 @@ async def waybill_page(job_id: str):
     if not w:
         raise HTTPException(status_code=404, detail="Путевой не найден")
     fields = w.setdefault("fields", {})
+    if w.get('processing'):
+        return HTMLResponse('<meta http-equiv="refresh" content="3"><p>Скан обрабатывается. Эта страница обновится автоматически.</p>')
     if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1 or fields.get('api_company_version') != 1) and w.get("pl_number"):
         try:
             await refresh_requisites(job_id)
@@ -1944,7 +2019,7 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=404)
 
     form      = await request.form()
-    if w.get("detection_warning") or any(
+    if w.get('processing') or w.get("detection_warning") or any(
         type(w.get("filled_on_scan", {}).get(field)) is not bool for field in SCAN_FIELDS
     ):
         raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
@@ -2078,6 +2153,7 @@ a:hover{{text-decoration:underline}}
   <div class="stat"><div class="num">{count_pending}</div><p>Ожидают обработки</p></div>
   <div class="stat ok"><div class="num">{count_confirmed}</div><p>Подтверждено</p></div>
 </div>
+<ul>{queue_html}</ul>
 <div class="actions">
   <label class="upload-label">
     ↑ Загрузить файлы вручную
@@ -2095,6 +2171,9 @@ a:hover{{text-decoration:underline}}
 </form>
 <p class="tip">Или просто положите скан в папку <strong>{scan_folder}</strong> — браузер откроется автоматически.</p>
 <script>
+if ({has_queue}) setTimeout(() => {{
+  if (!document.querySelector('input[name="jobs"]:checked')) location.reload();
+}}, 5000);
 async function uploadFiles(files) {{
   const msg = document.getElementById('msg');
   msg.style.color = '#999'; msg.textContent = 'Загружаю ' + files.length + ' файл(ов)...';
