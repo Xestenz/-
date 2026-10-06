@@ -9,6 +9,8 @@
 """
 
 import base64
+import hashlib
+from pdf_archive import archive_pdf, marked_pdf, is_completed
 import html
 import io
 import json
@@ -53,6 +55,9 @@ def _load_env():
 _load_env()
 
 SCAN_FOLDER   = os.environ.get("SCAN_FOLDER", r"C:\Scans")
+OUTPUT_FOLDER = os.environ.get('OUTPUT_FOLDER', str(Path(__file__).parent / 'completed'))
+OUTPUT_MIRROR_FOLDER = os.environ.get('OUTPUT_MIRROR_FOLDER', '')
+_intake_lock = threading.RLock()
 TEMPLATE_PATH = Path(__file__).parent / "template_esm2.pdf"
 
 WEB_HOST = "127.0.0.1"
@@ -1357,11 +1362,30 @@ class ScanHandler(FileSystemEventHandler):
 
 
 def _handle_new_scan(file_path: str):
+    with _intake_lock:
+        with _pdf_lock:
+            if is_completed(file_path):
+                log.info('Готовый PDF пропущен: %s', file_path)
+                return
+        digest = hashlib.sha256(Path(file_path).read_bytes()).hexdigest()
+        for old in list(waybills.values()):
+            if not old.get('source_hash') and Path(old.get('file_path', '')).is_file():
+                old['source_hash'] = hashlib.sha256(Path(old['file_path']).read_bytes()).hexdigest()
+            if old.get('source_hash') == digest:
+                log.info('Повторный скан: открываем существующий путевой %s', old['id'])
+                webbrowser.open(f'http://{WEB_HOST}:{WEB_PORT}/waybill/{old["id"]}')
+                return
+        return _handle_unique_scan(file_path, digest)
+
+
+def _handle_unique_scan(file_path: str, digest: str):
     job_id = str(uuid.uuid4())[:8]
     log.info("Новый скан: %s → id=%s", file_path, job_id)
 
     entry = {
         "id":             job_id,
+        "source_hash": digest,
+        "processing": True,
         "file_path":      file_path,
         "file_name":      Path(file_path).name,
         "created_at":     datetime.now().isoformat(),
@@ -1415,6 +1439,8 @@ def _handle_new_scan(file_path: str):
         entry['reverse_warning'] = 'Не удалось прочитать оборот. Время из 1С оставлено без изменений.'
     _save_state()
 
+    entry['processing'] = False
+    _save_state()
     # Открываем браузер
     url = f"http://{WEB_HOST}:{WEB_PORT}/waybill/{job_id}"
     webbrowser.open(url)
@@ -1476,13 +1502,14 @@ async def index():
     confirmed = [w for w in waybills.values() if w["status"] == "confirmed"]
 
     rows = ""
-    for w in pending:
+    for w in pending + confirmed:
         rows += f"""
         <tr>
+          <td><input type="checkbox" name="jobs" value="{w['id']}"></td>
           <td>{w['created_at'][11:19]}</td>
           <td>{w['file_name']}</td>
           <td>{w['pl_number'] or '—'}</td>
-          <td><a href="/waybill/{w['id']}">Открыть →</a></td>
+          <td><a href="/waybill/{w['id']}">Открыть →</a> {'— сохранён' if w['status'] == 'confirmed' else ''}</td>
         </tr>"""
     if not rows:
         rows = "<tr><td colspan='4' style='color:#999;text-align:center'>Нет ожидающих</td></tr>"
@@ -1492,6 +1519,8 @@ async def index():
         count_pending=len(pending),
         count_confirmed=len(confirmed),
         scan_folder=SCAN_FOLDER,
+        output_folder=html.escape(OUTPUT_FOLDER),
+        mirror_folder=html.escape(OUTPUT_MIRROR_FOLDER or 'не включено'),
     ))
 
 
@@ -1874,6 +1903,39 @@ async def refresh_requisites(job_id: str):
     return {"ok": True}
 
 
+@app.post('/batch-print')
+async def batch_print(request: Request):
+    form = await request.form()
+    ids = list(dict.fromkeys(form.getlist('jobs')))
+    if not ids or len(ids) > 100:
+        raise HTTPException(status_code=400, detail='Выберите от 1 до 100 документов.')
+    selected = []
+    for job_id in ids:
+        w = waybills.get(job_id)
+        if not w:
+            raise HTTPException(status_code=404, detail='Путевой не найден')
+        if w.get('processing') or w.get('detection_warning') or w.get('review_fields') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
+            raise HTTPException(status_code=400, detail=f'Сначала проверьте поля документа {w.get("file_name", job_id)}.')
+        selected.append(w)
+    try:
+        with _pdf_lock:
+            with fitz.open() as combined:
+                for w in selected:
+                    data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan']))
+                    w['saved_paths'] = archive_pdf(data, _pdf_filename(_default_pdf_name(w)), w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
+                    w.pop('save_error', None)
+                    w['status'] = 'confirmed'
+                    with fitz.open(stream=data, filetype='pdf') as source:
+                        combined.insert_pdf(source)
+                combined.set_metadata({'subject': 'Waybill completed PDF'})
+                result = combined.tobytes()
+    except Exception as exc:
+        _save_state()
+        raise HTTPException(status_code=500, detail='Пакет не завершён. Уже сохранённые файлы остаются в папках; повтор не создаст их дубли. ' + str(exc))
+    _save_state()
+    return Response(result, media_type='application/pdf', headers={'Content-Disposition': 'inline; filename="waybills.pdf"'})
+
+
 @app.post("/print/{job_id}")
 async def print_waybill(job_id: str, request: Request):
     """Принять заполненные поля, сгенерировать PDF и вернуть его браузеру."""
@@ -1947,7 +2009,20 @@ async def print_waybill(job_id: str, request: Request):
         _save_state()
         raise HTTPException(status_code=500, detail=str(exc))
 
+    try:
+        # Archive a full scan copy even when the requested printout is additions-only.
+        full_pdf = pdf_bytes if print_mode == 'copy' else fill_scan_pdf(scan_path, fields, filled_on_scan)
+        with _pdf_lock:
+            full_pdf = marked_pdf(full_pdf)
+        w['saved_paths'] = archive_pdf(full_pdf, _pdf_filename(_default_pdf_name(w)), w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
+        w.pop('save_error', None)
+    except Exception as exc:
+        w['save_error'] = str(exc)
+        _save_state()
+        raise HTTPException(status_code=500, detail='PDF сформирован, но сохранение в папки не завершено. Проверьте доступ и повторите: ' + str(exc))
     w["status"] = "confirmed"
+    with _pdf_lock:
+        pdf_bytes = marked_pdf(pdf_bytes)
     _save_state()
     _auto_calibrate()
 
@@ -1967,7 +2042,6 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <title>Путевые листы ЭСМ-2</title>
-<meta http-equiv="refresh" content="10">
 <style>
 body{{font-family:Arial,sans-serif;margin:30px;background:#f0f2f5}}
 h1{{color:#2c3e50;margin-bottom:5px}}
@@ -1998,7 +2072,8 @@ a:hover{{text-decoration:underline}}
 </head>
 <body>
 <h1>Обработка путевых листов ЭСМ-2</h1>
-<p class="subtitle">Мониторинг папки: <code>{scan_folder}</code> &nbsp;·&nbsp; страница обновляется каждые 10 сек.</p>
+<p class="subtitle">Мониторинг папки: <code>{scan_folder}</code> &nbsp;·&nbsp; <a href="/">Обновить список</a></p>
+<p>Готовые PDF: <code>{output_folder}</code><br>Вторая копия: <code>{mirror_folder}</code></p>
 <div class="stats">
   <div class="stat"><div class="num">{count_pending}</div><p>Ожидают обработки</p></div>
   <div class="stat ok"><div class="num">{count_confirmed}</div><p>Подтверждено</p></div>
@@ -2010,10 +2085,14 @@ a:hover{{text-decoration:underline}}
   </label>
   <span id="msg"></span>
 </div>
+<form method="post" action="/batch-print" target="_blank">
+<p>Выберите проверенные документы. Пакет использует сохранённые значения полей.</p>
+<button class="btn btn-green" type="submit">Сохранить и открыть выбранные одним PDF</button>
 <table>
-  <thead><tr><th>Время</th><th>Файл</th><th>№ Путевого</th><th>Действие</th></tr></thead>
+  <thead><tr><th>Выбор</th><th>Время</th><th>Файл</th><th>№ Путевого</th><th>Действие</th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
+</form>
 <p class="tip">Или просто положите скан в папку <strong>{scan_folder}</strong> — браузер откроется автоматически.</p>
 <script>
 async function uploadFiles(files) {{
@@ -2285,6 +2364,10 @@ def _render_waybill(w: dict) -> str:
         'Несохранённые изменения формы будут потеряны.</p>'
     )
     btn_html = """
+    <button type="button" onclick="printWaybill('copy', this, 'folders')"
+      style="width:100%;padding:14px;background:#27ae60;color:white;border:0;border-radius:6px;cursor:pointer">
+      Сохранить в рабочие папки без скачивания
+    </button>
     <button type="button" onclick="printWaybill('copy', this)"
       style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
@@ -2713,7 +2796,9 @@ async function printWaybill(mode, btn, download = false) {{
     const disposition = resp.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     const filename = match ? decodeURIComponent(match[1]) : 'waybill.pdf';
-    if (download) {{
+    if (download === 'folders') {{
+      URL.revokeObjectURL(url);
+    }} else if (download) {{
       const link = document.createElement('a');
       link.href = url;
       link.download = filename;
@@ -2726,6 +2811,7 @@ async function printWaybill(mode, btn, download = false) {{
     }}
     btn.textContent = originalLabel;
     btn.disabled = false;
+    msg.style.display = 'block'; msg.className = ''; msg.textContent = 'PDF сохранён в настроенные папки. Пути указаны на странице «Все путевые».';
   }} catch(e) {{
     msg.style.display = 'block';
     msg.className = 'err-msg'; msg.textContent = 'Ошибка: ' + e;

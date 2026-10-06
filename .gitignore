@@ -9,6 +9,7 @@ monitor_pl_queue.json.tmp
 
 # Загруженные сканы / тестовые PDF
 uploads/
+completed/
 *.log
 
 # Python
