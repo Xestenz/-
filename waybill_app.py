@@ -1980,17 +1980,27 @@ async def refresh_requisites(job_id: str):
 
 @app.post('/batch-print')
 async def batch_print(request: Request):
+    def problem(message, job_id=None, status=400):
+        link = f'/waybill/{quote(job_id)}' if job_id else '/'
+        return HTMLResponse('<!doctype html><meta charset="utf-8"><title>Проверка перед печатью</title>'
+            '<main style="font:18px Arial;max-width:800px;margin:50px auto;padding:20px">'
+            '<h2>Пакет пока не сформирован</h2><p>' + html.escape(message) + '</p>'
+            f'<p><a href="{link}">Открыть ' + ('путевой для проверки' if job_id else 'список путевых') + '</a></p>'
+            '<p>После проверки сохраните путевой, вернитесь к списку и повторите пакетную печать.</p></main>', status_code=status)
     form = await request.form()
     ids = list(dict.fromkeys(form.getlist('jobs')))
     if not ids or len(ids) > 100:
-        raise HTTPException(status_code=400, detail='Выберите от 1 до 100 документов.')
+        return problem('Выберите от 1 до 100 документов.')
     selected = []
     for job_id in ids:
         w = waybills.get(job_id)
         if not w:
-            raise HTTPException(status_code=404, detail='Путевой не найден')
+            return problem('Путевой не найден', status=404)
         if w.get('processing') or w.get('detection_warning') or w.get('review_fields') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
-            raise HTTPException(status_code=400, detail=f'Сначала проверьте поля документа {w.get("file_name", job_id)}.')
+            if w.get('review_fields'):
+                labels = [('Выезд' if key.startswith('time_out') else 'Возвращение') + ' — строка ' + key.rsplit('_', 1)[-1] for key in w['review_fields']]
+                return problem(f'В документе {w.get("file_name", job_id)} ИИ не уверен, заполнены ли ячейки: ' + ', '.join(labels) + '. Проверьте их на скане, выберите «Поле пустое — печатать», если нужно добавить время, и отметьте «Я проверил ячейку».', job_id)
+            return problem(f'Анализ документа {w.get("file_name", job_id)} ещё не завершён или завершился с ошибкой. Откройте документ и проверьте сообщение.', job_id)
         selected.append(w)
     try:
         with _pdf_lock:
@@ -2006,7 +2016,7 @@ async def batch_print(request: Request):
                 result = combined.tobytes()
     except Exception as exc:
         _save_state()
-        raise HTTPException(status_code=500, detail='Пакет не завершён. Уже сохранённые файлы остаются в папках; повтор не создаст их дубли. ' + str(exc))
+        return problem('Сохранение пакета не завершено. Уже записанные файлы остаются в папках. Проверьте доступ и повторите. ' + str(exc), status=500)
     _save_state()
     return Response(result, media_type='application/pdf', headers={'Content-Disposition': 'inline; filename="waybills.pdf"'})
 
@@ -2104,7 +2114,8 @@ async def print_waybill(job_id: str, request: Request):
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
-        headers={"Content-Disposition": f"inline; filename=\"waybill.pdf\"; filename*=UTF-8''{quote(filename)}"},
+        headers={"Content-Disposition": f"inline; filename=\"waybill.pdf\"; filename*=UTF-8''{quote(filename)}",
+                 'X-Saved-Paths': quote(json.dumps(w.get('saved_paths', []), ensure_ascii=False))},
     )
 
 
@@ -2860,6 +2871,13 @@ async function printWaybill(mode, btn, download = false) {{
   const msg = document.getElementById('msg');
   msg.style.display = 'none';
   try {{
+    const unchecked = document.querySelector('#frm input[name^="scan_review_"]:not(:checked)');
+    if (unchecked) {{
+      unchecked.closest('.scan-field').style.outline = '3px solid #e67e22';
+      unchecked.closest('.scan-field').scrollIntoView({{behavior:'smooth', block:'center'}});
+      unchecked.focus();
+      throw new Error('Файл не сохранён. Проверьте выделенную ячейку времени и отметьте «Я проверил ячейку».');
+    }}
     const data = new FormData(document.getElementById('frm'));
     data.set('print_mode', mode);
     const resp = await fetch('/print/{w["id"]}', {{
@@ -2867,8 +2885,8 @@ async function printWaybill(mode, btn, download = false) {{
       body: data
     }});
     if (!resp.ok) {{
-      const txt = await resp.text();
-      throw new Error(txt);
+      const error = await resp.json().catch(() => ({{detail:'Ошибка сохранения PDF'}}));
+      throw new Error(error.detail || 'Ошибка сохранения PDF');
     }}
     const blob = await resp.blob();
     const url  = URL.createObjectURL(blob);
@@ -2890,7 +2908,10 @@ async function printWaybill(mode, btn, download = false) {{
     }}
     btn.textContent = originalLabel;
     btn.disabled = false;
-    msg.style.display = 'block'; msg.className = ''; msg.textContent = 'PDF сохранён в настроенные папки. Пути указаны на странице «Все путевые».';
+    const saved = JSON.parse(decodeURIComponent(resp.headers.get('X-Saved-Paths') || '%5B%5D'));
+    msg.style.display = 'block'; msg.className = ''; msg.style.whiteSpace='pre-wrap';
+    msg.textContent = 'PDF сохранён:\\n' + saved.join('\\n');
+    msg.scrollIntoView({{behavior:'smooth', block:'nearest'}});
   }} catch(e) {{
     msg.style.display = 'block';
     msg.className = 'err-msg'; msg.textContent = 'Ошибка: ' + e;

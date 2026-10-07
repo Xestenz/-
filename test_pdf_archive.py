@@ -11,6 +11,18 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_batch_review_error_is_readable_and_links_to_document(self):
+        request = Mock()
+        request.form = AsyncMock(return_value=FormData([('jobs', 'one')]))
+        entry = {'file_name': 'scan.pdf', 'review_fields': ['time_in_1'],
+                 'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, True)}
+        with patch.object(app, 'waybills', {'one': entry}), patch.object(app, 'archive_pdf') as save:
+            response = asyncio.run(app.batch_print(request))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('/waybill/one', response.body.decode())
+        self.assertIn('Возвращение', response.body.decode())
+        save.assert_not_called()
+
     def test_failed_mirror_keeps_primary_and_retry_reuses_file(self):
         with tempfile.TemporaryDirectory() as directory:
             primary = Path(directory) / 'primary'
