@@ -2486,28 +2486,29 @@ def _render_waybill(w: dict) -> str:
         'Несохранённые изменения формы будут потеряны.</p>'
     )
     btn_html = """
-    <button type="button" onclick="printWaybill('copy', this, 'folders')"
-      style="width:100%;padding:14px;background:#27ae60;color:white;border:0;border-radius:6px;cursor:pointer">
-      Сохранить без печати
-    </button>
-    <button type="button" onclick="printWaybill('copy', this)"
-      style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
-             border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
-      Печать этого путевого
-    </button>
-    <button type="button" onclick="printWaybill('copy', this, 'group')"
-      style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Печать всей группы</button>
-    <p style="font-size:12px;color:#666">Все действия сохраняют PDF в рабочие папки. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
-    <details style="margin-top:12px"><summary>Другие варианты: допечатка и скачивание</summary><p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
-      Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.
-      Вставьте в принтер исходный бумажный путевой. Печатайте в масштабе 100%
-      («Фактический размер»), без подгонки под страницу. Сначала проверьте
-      совпадение на пробном листе, приложив его к оригиналу на просвет.</p>
     <button id="print-button" type="button" onclick="printWaybill('additions', this)"
       style="width:100%;padding:14px;background:#27ae60;color:white;border:none;
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
       🖨 Допечатать на оригинале
     </button>
+    <p style="font-size:12px;color:#555">Вставьте исходный бумажный путевой. Печатаются только добавленные данные. Масштаб — 100%.</p>
+    <button type="button" onclick="printWaybill('copy', this, 'folders')"
+      style="width:100%;padding:10px;background:white;color:#333;border:1px solid #bbb;border-radius:6px;cursor:pointer">
+      Сохранить без печати
+    </button>
+    <button type="button" onclick="printWaybill('copy', this)"
+      style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
+             border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
+      Печать полной копии на чистом листе
+    </button>
+    <button type="button" onclick="printWaybill('copy', this, 'group')"
+      style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Печать группы полных копий</button>
+    <p style="font-size:12px;color:#666">Все действия сохраняют PDF в рабочие папки. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
+    <details style="margin-top:12px"><summary>Скачать PDF</summary><p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
+      Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.
+      Вставьте в принтер исходный бумажный путевой. Печатайте в масштабе 100%
+      («Фактический размер»), без подгонки под страницу. Сначала проверьте
+      совпадение на пробном листе, приложив его к оригиналу на просвет.</p>
     <div style="display:flex;gap:8px;margin-top:12px">
       <button type="button" onclick="printWaybill('copy', this, true)"
         style="flex:1;padding:10px;cursor:pointer">💾 Сохранить копию PDF</button>
