@@ -63,7 +63,9 @@ _state_lock = threading.RLock()
 SCAN_WORKERS = max(1, min(4, int(os.environ.get('SCAN_WORKERS', '2'))))
 _scan_pool = ThreadPoolExecutor(max_workers=SCAN_WORKERS, thread_name_prefix='scan')
 _queued_paths = {}
+_queued_batches = {}
 _active_hashes = set()
+_folder_batch = ['', 0.0]
 TEMPLATE_PATH = Path(__file__).parent / "template_esm2.pdf"
 
 WEB_HOST = "127.0.0.1"
@@ -1365,12 +1367,19 @@ def read_barcode(file_path: str) -> Optional[str]:
 # Watchdog — мониторинг папки сканера
 # ---------------------------------------------------------------------------
 
-def _enqueue_scan(file_path, wait_for_file=False):
+def _enqueue_scan(file_path, wait_for_file=False, batch_id=None):
     key = os.path.normcase(os.path.abspath(file_path))
     with _state_lock:
         if key in _queued_paths:
             return
         _queued_paths[key] = 'Ожидает обработки'
+        if not batch_id:
+            now = time.monotonic()
+            if now - _folder_batch[1] > 120 or not _folder_batch[0]:
+                _folder_batch[0] = uuid.uuid4().hex
+            _folder_batch[1] = now
+            batch_id = _folder_batch[0]
+        _queued_batches[key] = batch_id
     def run():
         try:
             if wait_for_file:
@@ -1388,12 +1397,13 @@ def _enqueue_scan(file_path, wait_for_file=False):
                     raise RuntimeError('Файл не закончил записываться за 60 секунд')
             with _state_lock:
                 _queued_paths[key] = 'Обрабатывается'
-            _handle_new_scan(file_path)
+            _handle_new_scan(file_path, batch_id)
         except Exception:
             log.exception('Ошибка обработки файла %s', file_path)
         finally:
             with _state_lock:
                 _queued_paths.pop(key, None)
+                _queued_batches.pop(key, None)
     return _scan_pool.submit(run)
 
 
@@ -1407,7 +1417,7 @@ class ScanHandler(FileSystemEventHandler):
         _enqueue_scan(str(path), wait_for_file=True)
 
 
-def _handle_new_scan(file_path: str):
+def _handle_new_scan(file_path: str, batch_id=None):
     with _intake_lock:
         with _pdf_lock:
             if is_completed(file_path):
@@ -1418,6 +1428,10 @@ def _handle_new_scan(file_path: str):
             if not old.get('source_hash') and Path(old.get('file_path', '')).is_file():
                 old['source_hash'] = hashlib.sha256(Path(old['file_path']).read_bytes()).hexdigest()
             if old.get('source_hash') == digest:
+                if batch_id and not old.get('processing'):
+                    old.setdefault('batch_ids', []).append(batch_id)
+                    old['batch_id'] = batch_id
+                    _save_state()
                 log.info('Повторный скан: открываем существующий путевой %s', old['id'])
                 webbrowser.open(f'http://{WEB_HOST}:{WEB_PORT}/waybill/{old["id"]}')
                 return
@@ -1425,19 +1439,20 @@ def _handle_new_scan(file_path: str):
             return
         _active_hashes.add(digest)
     try:
-        return _handle_unique_scan(file_path, digest)
+        return _handle_unique_scan(file_path, digest, batch_id)
     finally:
         with _intake_lock:
             _active_hashes.discard(digest)
 
 
-def _handle_unique_scan(file_path: str, digest: str):
+def _handle_unique_scan(file_path: str, digest: str, batch_id=None):
     job_id = str(uuid.uuid4())[:8]
     log.info("Новый скан: %s → id=%s", file_path, job_id)
 
     entry = {
         "id":             job_id,
         "source_hash": digest,
+        "batch_id": batch_id or uuid.uuid4().hex,
         "processing": True,
         "file_path":      file_path,
         "file_name":      Path(file_path).name,
@@ -1576,6 +1591,13 @@ async def index():
         key=lambda x: x["created_at"], reverse=True,
     )
     confirmed = [w for w in entries if w["status"] == "confirmed"]
+    grouped = [w for w in entries if w.get('batch_id')]
+    latest = max(grouped, key=lambda w: w['created_at']) if grouped else None
+    group_action = ''
+    if latest:
+        group_count = sum(w.get('batch_id') == latest['batch_id'] or latest['batch_id'] in w.get('batch_ids', []) for w in entries)
+        group_action = (f'<form method="post" action="/batch-print" target="_blank"><input type="hidden" name="group_job" value="{latest["id"]}">'
+                        f'<button class="btn btn-green">Печать последней группы ({group_count} документов)</button></form>')
 
     rows = ""
     for w in pending + confirmed:
@@ -1599,6 +1621,7 @@ async def index():
         mirror_folder=html.escape(OUTPUT_MIRROR_FOLDER or 'не включено'),
         queue_html=''.join('<li>' + html.escape(Path(path).name + ': ' + status) + '</li>' for path, status in queue),
         has_queue='true' if queue else 'false',
+        group_action=group_action,
     ))
 
 
@@ -1620,7 +1643,7 @@ async def upload_file(request: Request):
     save_path = save_dir / f"{uuid.uuid4().hex[:8]}_{file.filename}"
     save_path.write_bytes(await file.read())
 
-    _enqueue_scan(str(save_path))
+    _enqueue_scan(str(save_path), batch_id=str(form.get('batch_id') or uuid.uuid4().hex))
     return JSONResponse({"ok": True})
 
 
@@ -1989,6 +2012,19 @@ async def batch_print(request: Request):
             '<p>После проверки сохраните путевой, вернитесь к списку и повторите пакетную печать.</p></main>', status_code=status)
     form = await request.form()
     ids = list(dict.fromkeys(form.getlist('jobs')))
+    group_job = form.get('group_job')
+    if group_job:
+        base = waybills.get(group_job)
+        if not base:
+            return problem('Путевой не найден', status=404)
+        group = base.get('batch_id')
+        if group:
+            with _state_lock:
+                if group in _queued_batches.values():
+                    return problem('Часть файлов этой группы ещё в очереди или обрабатывается. Дождитесь завершения и повторите печать.')
+            ids = [w['id'] for w in list(waybills.values()) if w.get('batch_id') == group or group in w.get('batch_ids', [])]
+        else:
+            return problem('Этот документ загружен до появления групп. Для него выберите документы на странице «Все путевые».')
     if not ids or len(ids) > 100:
         return problem('Выберите от 1 до 100 документов.')
     selected = []
@@ -1996,10 +2032,7 @@ async def batch_print(request: Request):
         w = waybills.get(job_id)
         if not w:
             return problem('Путевой не найден', status=404)
-        if w.get('processing') or w.get('detection_warning') or w.get('review_fields') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
-            if w.get('review_fields'):
-                labels = [('Выезд' if key.startswith('time_out') else 'Возвращение') + ' — строка ' + key.rsplit('_', 1)[-1] for key in w['review_fields']]
-                return problem(f'В документе {w.get("file_name", job_id)} ИИ не уверен, заполнены ли ячейки: ' + ', '.join(labels) + '. Проверьте их на скане, выберите «Поле пустое — печатать», если нужно добавить время, и отметьте «Я проверил ячейку».', job_id)
+        if w.get('processing') or w.get('detection_warning') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
             return problem(f'Анализ документа {w.get("file_name", job_id)} ещё не завершён или завершился с ошибкой. Откройте документ и проверьте сообщение.', job_id)
         selected.append(w)
     try:
@@ -2034,9 +2067,6 @@ async def print_waybill(job_id: str, request: Request):
     ):
         raise HTTPException(status_code=400, detail="Анализ заполненных полей не завершён. Повторно загрузите скан перед печатью.")
     fields    = dict(form)
-    for key in w.get('review_fields', []):
-        if fields.pop('scan_review_' + key, '') != '1':
-            raise HTTPException(status_code=400, detail="Проверьте сомнительные ячейки времени и отметьте «Я проверил ячейку» перед печатью.")
     filled_on_scan = dict(w['filled_on_scan'])
     for key in SCAN_FIELDS:
         if fields.pop('scan_override_' + key, '') == '1':
@@ -2165,6 +2195,7 @@ a:hover{{text-decoration:underline}}
   <div class="stat ok"><div class="num">{count_confirmed}</div><p>Подтверждено</p></div>
 </div>
 <ul>{queue_html}</ul>
+{group_action}
 <div class="actions">
   <label class="upload-label">
     ↑ Загрузить файлы вручную
@@ -2173,8 +2204,8 @@ a:hover{{text-decoration:underline}}
   <span id="msg"></span>
 </div>
 <form method="post" action="/batch-print" target="_blank">
-<p>Выберите проверенные документы. Пакет использует сохранённые значения полей.</p>
-<button class="btn btn-green" type="submit">Сохранить и открыть выбранные одним PDF</button>
+<p>Для другой подборки можно отметить документы ниже. Пакет использует сохранённые значения полей.</p>
+<button class="btn" type="submit">Печать выбранных вручную</button>
 <table>
   <thead><tr><th>Выбор</th><th>Время</th><th>Файл</th><th>№ Путевого</th><th>Действие</th></tr></thead>
   <tbody>{rows}</tbody>
@@ -2186,11 +2217,13 @@ if ({has_queue}) setTimeout(() => {{
   if (!document.querySelector('input[name="jobs"]:checked')) location.reload();
 }}, 5000);
 async function uploadFiles(files) {{
+  const batchId = Date.now().toString(36) + Math.random().toString(36).slice(2);
   const msg = document.getElementById('msg');
   msg.style.color = '#999'; msg.textContent = 'Загружаю ' + files.length + ' файл(ов)...';
   for (const file of files) {{
     const fd = new FormData();
     fd.append('file', file);
+    fd.append('batch_id', batchId);
     await fetch('/upload', {{method:'POST', body:fd}});
   }}
   msg.style.color = '#27ae60'; msg.textContent = 'Готово, обрабатываю...';
@@ -2324,8 +2357,7 @@ def _render_waybill(w: dict) -> str:
                               on_scan=on_scan, **kw)
         if name in w.get('review_fields', []):
             control = control.replace('на скане ✏', 'нужно проверить')
-            control += (f'<label class="scan-choice"><input type="checkbox" name="scan_review_{name}" value="1">'
-                        'Я проверил ячейку</label><small>ИИ не уверен. Если ячейка пустая, включите печать ниже.</small>')
+            control += '<small>ИИ не уверен в заполненности. Если ячейка пустая, можно разрешить печать ниже.</small>'
         checked = '' if on_scan else ' checked'
         return (f'<div class="scan-field" data-name="{name}" '
                 f'data-value="{html.escape(str(value), quote=True)}">' + control
@@ -2456,14 +2488,17 @@ def _render_waybill(w: dict) -> str:
     btn_html = """
     <button type="button" onclick="printWaybill('copy', this, 'folders')"
       style="width:100%;padding:14px;background:#27ae60;color:white;border:0;border-radius:6px;cursor:pointer">
-      Сохранить в рабочие папки без скачивания
+      Сохранить без печати
     </button>
     <button type="button" onclick="printWaybill('copy', this)"
       style="width:100%;padding:14px;background:#2980b9;color:white;border:none;
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
-      🖨 Распечатать копию со сканом
+      Печать этого путевого
     </button>
-    <p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
+    <button type="button" onclick="printWaybill('copy', this, 'group')"
+      style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Печать всей группы</button>
+    <p style="font-size:12px;color:#666">Все действия сохраняют PDF в рабочие папки. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
+    <details style="margin-top:12px"><summary>Другие варианты: допечатка и скачивание</summary><p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
       Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.
       Вставьте в принтер исходный бумажный путевой. Печатайте в масштабе 100%
       («Фактический размер»), без подгонки под страницу. Сначала проверьте
@@ -2478,7 +2513,7 @@ def _render_waybill(w: dict) -> str:
         style="flex:1;padding:10px;cursor:pointer">💾 Сохранить копию PDF</button>
       <button type="button" onclick="printWaybill('additions', this, true)"
         style="flex:1;padding:10px;cursor:pointer">💾 Сохранить допечатку PDF</button>
-    </div>"""
+    </div></details>"""
 
     err_block = ""
     if w.get("error"):
@@ -2871,13 +2906,6 @@ async function printWaybill(mode, btn, download = false) {{
   const msg = document.getElementById('msg');
   msg.style.display = 'none';
   try {{
-    const unchecked = document.querySelector('#frm input[name^="scan_review_"]:not(:checked)');
-    if (unchecked) {{
-      unchecked.closest('.scan-field').style.outline = '3px solid #e67e22';
-      unchecked.closest('.scan-field').scrollIntoView({{behavior:'smooth', block:'center'}});
-      unchecked.focus();
-      throw new Error('Файл не сохранён. Проверьте выделенную ячейку времени и отметьте «Я проверил ячейку».');
-    }}
     const data = new FormData(document.getElementById('frm'));
     data.set('print_mode', mode);
     const resp = await fetch('/print/{w["id"]}', {{
@@ -2893,7 +2921,13 @@ async function printWaybill(mode, btn, download = false) {{
     const disposition = resp.headers.get('Content-Disposition') || '';
     const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
     const filename = match ? decodeURIComponent(match[1]) : 'waybill.pdf';
-    if (download === 'folders') {{
+    if (download === 'group') {{
+      URL.revokeObjectURL(url);
+      const groupForm = document.createElement('form');
+      groupForm.method = 'POST'; groupForm.action = '/batch-print'; groupForm.target = '_blank';
+      const field = document.createElement('input'); field.type='hidden'; field.name='group_job'; field.value='{w["id"]}';
+      groupForm.appendChild(field); document.body.appendChild(groupForm); groupForm.submit(); groupForm.remove();
+    }} else if (download === 'folders') {{
       URL.revokeObjectURL(url);
     }} else if (download) {{
       const link = document.createElement('a');

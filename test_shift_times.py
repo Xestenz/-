@@ -31,15 +31,16 @@ class ShiftTimesTests(unittest.TestCase):
         self.assertEqual(review, ['time_in_1'])
         self.assertTrue(detected['time_in_1'])
 
-    def test_uncertain_time_requires_operator_confirmation(self):
-        entry = {'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False), 'review_fields': ['time_in_1']}
+    def test_uncertain_time_does_not_require_confirmation(self):
+        entry = {'id': 'test', 'file_path': str(app.TEMPLATE_PATH),
+                 'fields': {'work_date': '07.10.2026'},
+                 'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, True), 'review_fields': ['time_in_1']}
         request = Mock()
         request.form = AsyncMock(return_value={})
-        with patch.object(app, 'waybills', {'test': entry}), patch.object(app, '_save_state') as save:
-            with self.assertRaises(app.HTTPException) as exc:
-                asyncio.run(app.print_waybill('test', request))
-        self.assertEqual(exc.exception.status_code, 400)
-        save.assert_not_called()
+        with patch.object(app, 'waybills', {'test': entry}), patch.object(app, '_save_state'), \
+             patch.object(app, 'archive_pdf', return_value=[]), patch.object(app, '_auto_calibrate'):
+            response = asyncio.run(app.print_waybill('test', request))
+        self.assertEqual(response.status_code, 200)
 
     def test_operator_can_correct_scan_status_and_print_time(self):
         for allow in (True, False):

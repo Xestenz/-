@@ -29,7 +29,7 @@ class ParallelScanTests(unittest.TestCase):
     def test_queue_suppresses_same_path_while_running(self):
         entered = threading.Event()
         release = threading.Event()
-        def work(path):
+        def work(path, batch_id=None):
             entered.set()
             release.wait(5)
         with patch.object(app, '_handle_new_scan', side_effect=work) as process:

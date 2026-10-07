@@ -11,17 +11,21 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
-    def test_batch_review_error_is_readable_and_links_to_document(self):
+    def test_group_ignores_review_flags_and_excludes_other_groups(self):
         request = Mock()
-        request.form = AsyncMock(return_value=FormData([('jobs', 'one')]))
-        entry = {'file_name': 'scan.pdf', 'review_fields': ['time_in_1'],
-                 'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, True)}
-        with patch.object(app, 'waybills', {'one': entry}), patch.object(app, 'archive_pdf') as save:
+        request.form = AsyncMock(return_value=FormData([('group_job', 'one')]))
+        entries = {key: {'id': key, 'file_name': key, 'file_path': str(app.TEMPLATE_PATH),
+            'batch_id': group, 'review_fields': ['time_in_1'],
+            'fields': {'work_date': '07.10.2026'},
+            'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, True)}
+            for key, group in [('one', 'A'), ('two', 'A'), ('other', 'B')]}
+        with patch.object(app, 'waybills', entries), patch.object(app, 'archive_pdf', return_value=[]) as save, \
+             patch.object(app, '_save_state'), patch.object(app, '_queued_batches', {}):
             response = asyncio.run(app.batch_print(request))
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('/waybill/one', response.body.decode())
-        self.assertIn('Возвращение', response.body.decode())
-        save.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(save.call_count, 2)
+        with fitz.open(stream=response.body, filetype='pdf') as doc:
+            self.assertEqual(len(doc), 4)
 
     def test_failed_mirror_keeps_primary_and_retry_reuses_file(self):
         with tempfile.TemporaryDirectory() as directory:
