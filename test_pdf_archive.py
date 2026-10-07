@@ -11,6 +11,24 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_additions_batch_has_one_page_per_original_and_archives_full_copies(self):
+        entries = {key: {'id': key, 'file_name': key, 'pl_number': number,
+            'file_path': str(app.TEMPLATE_PATH), 'fields': {'work_date': '07.10.2026', 'time_out_1': '09:00'},
+            'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False)}
+            for key, number in [('one', '222'), ('two', '111')]}
+        request = Mock()
+        request.form = AsyncMock(return_value=FormData([('jobs', 'one'), ('jobs', 'two'), ('print_mode', 'additions')]))
+        with patch.object(app, 'waybills', entries), patch.object(app, '_save_completed', return_value=[]) as save, patch.object(app, '_save_state'):
+            response = asyncio.run(app.batch_print(request))
+        with fitz.open(stream=response.body, filetype='pdf') as doc:
+            self.assertEqual(len(doc), 2)
+            self.assertEqual([row[1] for row in doc.get_toc()], ['111', '222'])
+            self.assertIn('09:00', doc[0].get_text())
+            self.assertFalse(doc[0].get_images())
+        for call in save.call_args_list:
+            with fitz.open(stream=call.args[1], filetype='pdf') as archived:
+                self.assertEqual(len(archived), 2)
+
     def test_replace_source_after_both_outputs_and_preserve_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             inbox = Path(directory) / 'inbox'

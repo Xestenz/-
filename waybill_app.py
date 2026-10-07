@@ -1625,7 +1625,7 @@ async def index():
     if latest:
         group_count = sum(w.get('batch_id') == latest['batch_id'] or latest['batch_id'] in w.get('batch_ids', []) for w in entries)
         group_action = (f'<form method="post" action="/batch-print" target="_blank"><input type="hidden" name="group_job" value="{latest["id"]}">'
-                        f'<button class="btn btn-green">Печать последней группы ({group_count} документов)</button></form>')
+                        f'<button class="btn btn-green" name="print_mode" value="additions">Допечатать последнюю группу ({group_count} документов)</button></form>')
 
     rows = ""
     for w in pending + confirmed:
@@ -2039,6 +2039,9 @@ async def batch_print(request: Request):
             f'<p><a href="{link}">Открыть ' + ('путевой для проверки' if job_id else 'список путевых') + '</a></p>'
             '<p>После проверки сохраните путевой, вернитесь к списку и повторите пакетную печать.</p></main>', status_code=status)
     form = await request.form()
+    mode = form.get('print_mode', 'copy')
+    if mode not in ('copy', 'additions'):
+        return problem('Неизвестный режим печати.')
     ids = list(dict.fromkeys(form.getlist('jobs')))
     group_job = form.get('group_job')
     if group_job:
@@ -2063,24 +2066,30 @@ async def batch_print(request: Request):
         if w.get('processing') or w.get('detection_warning') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
             return problem(f'Анализ документа {w.get("file_name", job_id)} ещё не завершён или завершился с ошибкой. Откройте документ и проверьте сообщение.', job_id)
         selected.append(w)
+    selected.sort(key=lambda w: (str(w.get('pl_number') or ''), w.get('file_name', ''), w['id']))
     try:
         with _pdf_lock:
             with fitz.open() as combined:
+                bookmarks = []
                 for w in selected:
                     _prepare_source(w)
                     data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan']))
                     w['saved_paths'] = _save_completed(w, data, _pdf_filename(_default_pdf_name(w)))
                     w.pop('save_error', None)
                     w['status'] = 'confirmed'
-                    with fitz.open(stream=data, filetype='pdf') as source:
+                    print_data = fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan'], additions_only=True) if mode == 'additions' else data
+                    bookmarks.append([1, str(w.get('pl_number') or w.get('file_name') or w['id']), len(combined) + 1])
+                    with fitz.open(stream=print_data, filetype='pdf') as source:
                         combined.insert_pdf(source)
+                combined.set_toc(bookmarks)
                 combined.set_metadata({'subject': 'Waybill completed PDF'})
                 result = combined.tobytes()
     except Exception as exc:
         _save_state()
         return problem('Сохранение пакета не завершено. Уже записанные файлы остаются в папках. Проверьте доступ и повторите. ' + str(exc), status=500)
     _save_state()
-    return Response(result, media_type='application/pdf', headers={'Content-Disposition': 'inline; filename="waybills.pdf"'})
+    name = 'waybills-additions.pdf' if mode == 'additions' else 'waybills.pdf'
+    return Response(result, media_type='application/pdf', headers={'Content-Disposition': f'inline; filename="{name}"'})
 
 
 @app.post("/print/{job_id}")
@@ -2235,7 +2244,9 @@ a:hover{{text-decoration:underline}}
 </div>
 <form method="post" action="/batch-print" target="_blank">
 <p>Для другой подборки можно отметить документы ниже. Пакет использует сохранённые значения полей.</p>
-<button class="btn" type="submit">Печать выбранных вручную</button>
+<button class="btn btn-green" type="submit" name="print_mode" value="additions">Допечатать выбранные оригиналы</button>
+<button class="btn" type="submit" name="print_mode" value="copy">Полные копии выбранных</button>
+<p>Порядок: по номеру путевого, затем по имени файла. Для допечатки: одна лицевая сторона на документ, масштаб 100%, односторонняя печать. Порядок также указан в закладках PDF.</p>
 <table>
   <thead><tr><th>Выбор</th><th>Время</th><th>Файл</th><th>№ Путевого</th><th>Действие</th></tr></thead>
   <tbody>{rows}</tbody>
@@ -2531,10 +2542,12 @@ def _render_waybill(w: dict) -> str:
              border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px;font-weight:700">
       Печать полной копии на чистом листе
     </button>
-    <button type="button" onclick="printWaybill('copy', this, 'group')"
-      style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Печать группы полных копий</button>
+    <button type="button" onclick="printWaybill('additions', this, 'group')"
+      style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Допечатать всю группу на оригиналах</button>
+    <p style="font-size:12px">Разложите оригиналы по номеру путевого, затем по имени файла. В PDF — одна лицевая сторона на путевой, включая пустые страницы без дополнений. Печатайте односторонне, масштаб 100%. Порядок виден в закладках PDF.</p>
     <p style="font-size:12px;color:#666">Все действия сохраняют PDF в рабочие папки. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
     <details style="margin-top:12px"><summary>Скачать PDF</summary><p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
+      <button type="button" onclick="printWaybill('copy', this, 'group')">Полные копии всей группы</button>
       Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.
       Вставьте в принтер исходный бумажный путевой. Печатайте в масштабе 100%
       («Фактический размер»), без подгонки под страницу. Сначала проверьте
@@ -2957,6 +2970,7 @@ async function printWaybill(mode, btn, download = false) {{
       const groupForm = document.createElement('form');
       groupForm.method = 'POST'; groupForm.action = '/batch-print'; groupForm.target = '_blank';
       const field = document.createElement('input'); field.type='hidden'; field.name='group_job'; field.value='{w["id"]}';
+      const modeField = document.createElement('input'); modeField.type='hidden'; modeField.name='print_mode'; modeField.value=mode; groupForm.appendChild(modeField);
       groupForm.appendChild(field); document.body.appendChild(groupForm); groupForm.submit(); groupForm.remove();
     }} else if (download === 'folders') {{
       URL.revokeObjectURL(url);
