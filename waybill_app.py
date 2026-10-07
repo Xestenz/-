@@ -2039,7 +2039,7 @@ async def batch_print(request: Request):
             f'<p><a href="{link}">Открыть ' + ('путевой для проверки' if job_id else 'список путевых') + '</a></p>'
             '<p>После проверки сохраните путевой, вернитесь к списку и повторите пакетную печать.</p></main>', status_code=status)
     form = await request.form()
-    mode = form.get('print_mode', 'copy')
+    mode = form.get('print_mode', 'additions')
     if mode not in ('copy', 'additions'):
         return problem('Неизвестный режим печати.')
     ids = list(dict.fromkeys(form.getlist('jobs')))
@@ -2073,13 +2073,12 @@ async def batch_print(request: Request):
                 bookmarks = []
                 for w in selected:
                     _prepare_source(w)
-                    data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan']))
+                    data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan'], additions_only=mode == 'additions'))
                     w['saved_paths'] = _save_completed(w, data, _pdf_filename(_default_pdf_name(w)))
                     w.pop('save_error', None)
                     w['status'] = 'confirmed'
-                    print_data = fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan'], additions_only=True) if mode == 'additions' else data
                     bookmarks.append([1, str(w.get('pl_number') or w.get('file_name') or w['id']), len(combined) + 1])
-                    with fitz.open(stream=print_data, filetype='pdf') as source:
+                    with fitz.open(stream=data, filetype='pdf') as source:
                         combined.insert_pdf(source)
                 combined.set_toc(bookmarks)
                 combined.set_metadata({'subject': 'Waybill completed PDF'})
@@ -2131,7 +2130,7 @@ async def print_waybill(job_id: str, request: Request):
     fields['manual_time_fields'] = sorted(manual_times)
     if fields.get("company_name"):
         fields["company_name_manual"] = fields['company_name'] != w.get('fields', {}).get('api_company_name', '')
-    print_mode = fields.pop("print_mode", "copy")
+    print_mode = fields.pop("print_mode", "additions")
     if print_mode not in ("copy", "additions"):
         raise HTTPException(status_code=400, detail="Неизвестный режим печати")
     pl_number = w.get("pl_number") or fields.pop("pl_number_manual", "") or "???"
@@ -2164,11 +2163,10 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(exc))
 
     try:
-        # Archive a full scan copy even when the requested printout is additions-only.
-        full_pdf = pdf_bytes if print_mode == 'copy' else fill_scan_pdf(scan_path, fields, filled_on_scan)
+        # Archive exactly the selected output: additions by default, copy only explicitly.
         with _pdf_lock:
-            full_pdf = marked_pdf(full_pdf)
-        w['saved_paths'] = _save_completed(w, full_pdf, _pdf_filename(_default_pdf_name(w)))
+            archived_pdf = marked_pdf(pdf_bytes)
+        w['saved_paths'] = _save_completed(w, archived_pdf, _pdf_filename(_default_pdf_name(w)))
         w.pop('save_error', None)
     except Exception as exc:
         w['save_error'] = str(exc)
@@ -2533,7 +2531,7 @@ def _render_waybill(w: dict) -> str:
       🖨 Допечатать на оригинале
     </button>
     <p style="font-size:12px;color:#555">Вставьте исходный бумажный путевой. Печатаются только добавленные данные. Масштаб — 100%.</p>
-    <button type="button" onclick="printWaybill('copy', this, 'folders')"
+    <button type="button" onclick="printWaybill('additions', this, 'folders')"
       style="width:100%;padding:10px;background:white;color:#333;border:1px solid #bbb;border-radius:6px;cursor:pointer">
       Сохранить без печати
     </button>

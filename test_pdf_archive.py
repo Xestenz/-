@@ -11,7 +11,7 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
-    def test_additions_batch_has_one_page_per_original_and_archives_full_copies(self):
+    def test_additions_batch_archives_only_additions(self):
         entries = {key: {'id': key, 'file_name': key, 'pl_number': number,
             'file_path': str(app.TEMPLATE_PATH), 'fields': {'work_date': '07.10.2026', 'time_out_1': '09:00'},
             'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False)}
@@ -27,7 +27,9 @@ class ArchiveTests(unittest.TestCase):
             self.assertFalse(doc[0].get_images())
         for call in save.call_args_list:
             with fitz.open(stream=call.args[1], filetype='pdf') as archived:
-                self.assertEqual(len(archived), 2)
+                self.assertEqual(len(archived), 1)
+                self.assertFalse(archived[0].get_images())
+                self.assertIn('09:00', archived[0].get_text())
 
     def test_replace_source_after_both_outputs_and_preserve_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -82,7 +84,7 @@ class ArchiveTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(save.call_count, 2)
         with fitz.open(stream=response.body, filetype='pdf') as doc:
-            self.assertEqual(len(doc), 4)
+            self.assertEqual(len(doc), 2)
 
     def test_failed_mirror_keeps_primary_and_retry_reuses_file(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,7 +115,7 @@ class ArchiveTests(unittest.TestCase):
                 'fields': {'work_date': '07.10.2026'}, 'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False)}
                 for key in ('one', 'two')}
             request = Mock()
-            request.form = AsyncMock(return_value=FormData([('jobs', 'one'), ('jobs', 'two')]))
+            request.form = AsyncMock(return_value=FormData([('jobs', 'one'), ('jobs', 'two'), ('print_mode', 'copy')]))
             with patch.object(app, 'waybills', entries), patch.object(app, 'OUTPUT_FOLDER', directory), \
                  patch.object(app, 'OUTPUT_MIRROR_FOLDER', ''), patch.object(app, '_save_state'):
                 result = asyncio.run(app.batch_print(request))
