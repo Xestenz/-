@@ -20,7 +20,7 @@ class ParallelScanTests(unittest.TestCase):
         with patch.object(app, 'waybills', {}), patch.object(app, '_save_state'), \
              patch.object(app.webbrowser, 'open'), patch.object(app, 'detect_fields_with_ai', side_effect=front), \
              patch.object(app, 'read_reverse_times', side_effect=reverse), patch.object(app, 'read_barcode', side_effect=barcode):
-            entry = app._handle_unique_scan('test.pdf', 'test-hash')
+            entry = app._handle_unique_scan(str(app.TEMPLATE_PATH), 'test-hash')
         self.assertFalse(entry['processing'])
         self.assertIsNone(entry['detection_warning'])
         self.assertIsNone(entry['error'])

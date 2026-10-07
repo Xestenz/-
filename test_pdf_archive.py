@@ -11,6 +11,45 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_replace_source_after_both_outputs_and_preserve_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inbox = Path(directory) / 'inbox'
+            inbox.mkdir()
+            source = inbox / 'scan.pdf'
+            source.write_bytes(b'original')
+            cached = archive.preserve_source(source, Path(directory) / 'cache')
+            mirror = Path(directory) / 'mirror'
+            paths = archive.replace_scanned_file(b'completed', 'Client.pdf', 'one', source, cached, str(mirror))
+            self.assertFalse(source.exists())
+            self.assertEqual(Path(cached).read_bytes(), b'original')
+            self.assertEqual(len(list(inbox.glob('*.pdf'))), 1)
+            self.assertEqual(len(paths), 2)
+            archive.replace_scanned_file(b'updated', 'Client.pdf', 'one', source, cached, str(mirror))
+            self.assertEqual(len(list(inbox.glob('*.pdf'))), 1)
+
+    def test_replace_failure_leaves_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'scan.pdf'
+            source.write_bytes(b'original')
+            cached = archive.preserve_source(source, Path(directory) / 'cache')
+            blocked = Path(directory) / 'blocked'
+            blocked.write_text('not a folder')
+            with self.assertRaises(OSError):
+                archive.replace_scanned_file(b'completed', 'Client.pdf', 'one', source, cached, str(blocked))
+            self.assertEqual(source.read_bytes(), b'original')
+            source.write_bytes(b'changed')
+            with self.assertRaises(ValueError):
+                archive.replace_scanned_file(b'completed', 'Client.pdf', 'one', source, cached)
+            self.assertEqual(source.read_bytes(), b'changed')
+
+    def test_working_source_survives_original_move(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory) / 'scan.pdf'
+            original.write_bytes(b'original scan')
+            cached = Path(archive.preserve_source(original, Path(directory) / 'private'))
+            original.rename(Path(directory) / 'renamed.pdf')
+            self.assertEqual(cached.read_bytes(), b'original scan')
+
     def test_group_ignores_review_flags_and_excludes_other_groups(self):
         request = Mock()
         request.form = AsyncMock(return_value=FormData([('group_job', 'one')]))

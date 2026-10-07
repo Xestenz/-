@@ -11,7 +11,7 @@
 import base64
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pdf_archive import archive_pdf, marked_pdf, is_completed
+from pdf_archive import archive_pdf, marked_pdf, is_completed, preserve_source, replace_scanned_file
 import html
 import io
 import json
@@ -1446,6 +1446,8 @@ def _handle_new_scan(file_path: str, batch_id=None):
 
 
 def _handle_unique_scan(file_path: str, digest: str, batch_id=None):
+    original_path = file_path
+    file_path = preserve_source(file_path, Path(__file__).parent / 'uploads' / 'source_cache')
     job_id = str(uuid.uuid4())[:8]
     log.info("Новый скан: %s → id=%s", file_path, job_id)
 
@@ -1455,7 +1457,9 @@ def _handle_unique_scan(file_path: str, digest: str, batch_id=None):
         "batch_id": batch_id or uuid.uuid4().hex,
         "processing": True,
         "file_path":      file_path,
-        "file_name":      Path(file_path).name,
+        "original_path": original_path,
+        "replace_source": _in_scan_folder(original_path),
+        "file_name":      Path(original_path).name,
         "created_at":     datetime.now().isoformat(),
         "status":         "pending",
         "barcode":        None,
@@ -1533,6 +1537,30 @@ def _handle_unique_scan(file_path: str, digest: str, batch_id=None):
     webbrowser.open(url)
     log.info("  Браузер открыт: %s", url)
     return entry
+
+
+def _in_scan_folder(path):
+    try:
+        return os.path.samefile(Path(path).parent, SCAN_FOLDER)
+    except OSError:
+        return False
+
+
+def _prepare_source(w):
+    if not w.get('original_path'):
+        path = w['file_path']
+        if _in_scan_folder(path):
+            cached = preserve_source(path, Path(__file__).parent / 'uploads' / 'source_cache')
+            w.update(original_path=path, file_path=cached, replace_source=True)
+            _save_state()
+
+
+def _save_completed(w, data, filename):
+    if w.get('replace_source'):
+        paths = replace_scanned_file(data, filename, w['id'], w['original_path'], w['file_path'], OUTPUT_MIRROR_FOLDER)
+        w['source_replaced'] = True
+        return paths
+    return archive_pdf(data, filename, w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
 
 
 def _organization_lines(text: str) -> list[str]:
@@ -2039,8 +2067,9 @@ async def batch_print(request: Request):
         with _pdf_lock:
             with fitz.open() as combined:
                 for w in selected:
+                    _prepare_source(w)
                     data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan']))
-                    w['saved_paths'] = archive_pdf(data, _pdf_filename(_default_pdf_name(w)), w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
+                    w['saved_paths'] = _save_completed(w, data, _pdf_filename(_default_pdf_name(w)))
                     w.pop('save_error', None)
                     w['status'] = 'confirmed'
                     with fitz.open(stream=data, filetype='pdf') as source:
@@ -2116,6 +2145,7 @@ async def print_waybill(job_id: str, request: Request):
     log.info("Путевой %s — режим печати: %s", pl_number, print_mode)
 
     try:
+        _prepare_source(w)
         scan_path = w["file_path"]
         filled_on_scan = w.get("filled_on_scan", {})
         pdf_bytes = fill_scan_pdf(scan_path, fields, filled_on_scan, additions_only=print_mode == "additions")
@@ -2129,7 +2159,7 @@ async def print_waybill(job_id: str, request: Request):
         full_pdf = pdf_bytes if print_mode == 'copy' else fill_scan_pdf(scan_path, fields, filled_on_scan)
         with _pdf_lock:
             full_pdf = marked_pdf(full_pdf)
-        w['saved_paths'] = archive_pdf(full_pdf, _pdf_filename(_default_pdf_name(w)), w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
+        w['saved_paths'] = _save_completed(w, full_pdf, _pdf_filename(_default_pdf_name(w)))
         w.pop('save_error', None)
     except Exception as exc:
         w['save_error'] = str(exc)
