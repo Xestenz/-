@@ -782,6 +782,7 @@ _CROP_GROUPS: dict[str, list[str]] = {
 _CROP_STANDALONE = frozenset({"vehicle_plate", "driver_id"})
 
 _AI_FIELD_DESCRIPTIONS = """\
+- company_name: строка «Организация» над строкой «Заказчик». Круглая печать, подпись или росчерк, пересекающие строку, НЕ являются заполненными реквизитами организации.
 - work_date: дата составления (3 квадратика дд.мм.гг, блок "Коды" справа)
 - customer: строка "Заказчик"
 - vehicle_type: марка машины
@@ -794,6 +795,27 @@ _AI_FIELD_DESCRIPTIONS = """\
 - work_object_1..3: наименование и адрес объекта в строке 1–3
 - time_out_1..3: время выезда из гаража в строке 1–3
 - time_in_1..3: время возвращения в гараж в строке 1–3"""
+
+
+def _parse_field_response(data: dict) -> dict:
+    choice = data['choices'][0]
+    if choice.get('finish_reason') == 'length':
+        raise ValueError('Ответ ИИ обрезан по лимиту длины')
+    text = choice['message']['content'] or ''
+    # Некоторые совместимые API добавляют пояснение даже при требовании JSON.
+    # Принимаем только один полный объект, затем проверяем все поля ниже.
+    objects = []
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r'\{', text):
+        try:
+            value, _ = decoder.raw_decode(text[match.start():])
+            if isinstance(value, dict) and all(key in value for key in SCAN_FIELDS):
+                objects.append(value)
+        except ValueError:
+            pass
+    if len(objects) != 1:
+        raise ValueError('ИИ не вернул единственный полный JSON с полями скана')
+    return objects[0]
 
 
 def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) -> dict:
@@ -904,6 +926,11 @@ def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) 
             "Если неясно, собственная ли это запись или чужой росчерк, либо вырезка "
             "смещена и нельзя уверенно определить ячейку, верни null для этого времени. "
             "Не угадывай заполненность по наличию любого штриха.\n"
+            "Одиночная черточка, дуга, точка или хвост подписи без группы цифр времени "
+            "в колонке 4 или 7 означает false, а НЕ null. Проследи линию росчерка "
+            "в table_block: если она продолжается из подписи в колонке 3, 6 или 9, "
+            "это не время. Null нужен только если видна самостоятельная запись, "
+            "похожая на цифры времени, но её назначение неясно.\n"
             "Ответь СТРОГО валидным JSON без пояснений и markdown-разметки, "
             f"со всеми перечисленными ключами: {{{schema_hint}}}"
         )
@@ -919,8 +946,9 @@ def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) 
 
         payload = {
             "model": AI_MODEL,
-            "max_tokens": 512,
-            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 2048,
+            "messages": [{"role": "system", "content": "Return only the requested JSON object. No introduction, analysis, explanations or markdown."},
+                         {"role": "user", "content": content}],
         }
         headers = {
             "Authorization": f"Bearer {AI_API_KEY}",
@@ -941,12 +969,7 @@ def detect_fields_with_ai(file_path: str, review_fields: Optional[list] = None) 
         if resp.status_code >= 400:
             log.error("AI-провайдер ответил %s: %s", resp.status_code, resp.text[:500])
         resp.raise_for_status()
-        text = resp.json()["choices"][0]["message"]["content"].strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lower().startswith("json"):
-                text = text[4:]
-        ai_result = json.loads(text)
+        ai_result = _parse_field_response(resp.json())
 
         if not isinstance(ai_result, dict) or any(
             field not in ai_result or (type(ai_result[field]) is not bool and not (
@@ -1294,7 +1317,8 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         if not val:
             continue
         if field == "customer":
-            ins_centered(field, val, eff[1], _FSIZE)
+            for i, line in enumerate(_organization_lines(val)):
+                ins_centered(field, line, eff[1] - 4 + i * 7, 7)
             continue
         if field.startswith('work_object_'):
             x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
@@ -1959,6 +1983,8 @@ def _pdf_filename(value: str, fallback: str = "Путевой") -> str:
 
 def _default_pdf_name(w: dict) -> str:
     fields = w.get("fields", {})
+    if str(fields.get('output_filename') or '').strip():
+        return _pdf_filename(fields['output_filename'])[:-4]
     customer = str(fields.get("customer_short_name") or fields.get("customer") or "").strip()
     date = str(fields.get("work_date") or fields.get("api_work_date") or w.get("filename_date") or "").strip()
     # В старых записях дата терялась после отправки пустого поля «на скане».
@@ -1976,13 +2002,56 @@ def _default_pdf_name(w: dict) -> str:
             break
         except ValueError:
             pass
-    name = _pdf_filename(fields.get("output_filename") or customer,
+    dates = []
+    for row in fields.get('api_shift_rows', []):
+        try:
+            dates.append(datetime.strptime(row['date'], '%d.%m.%Y'))
+        except (KeyError, TypeError, ValueError):
+            continue
+    dates = sorted(set(dates))
+    if dates:
+        first, last = dates[0], dates[-1]
+        if first == last:
+            date = first.strftime('%d,%m')
+        elif first.year == last.year and first.month == last.month:
+            date = first.strftime('%d') + '-' + last.strftime('%d,%m')
+        else:
+            date = first.strftime('%d,%m') + '-' + last.strftime('%d,%m')
+    machine = re.search(r'\b[СC][МM]\s*[-№]?\s*(\d+)\b', str(fields.get('vehicle_type') or ''), re.I)
+    if machine:
+        customer += ' ' + str(int(machine.group(1))) + ' ед'
+    name = _pdf_filename(customer,
                          f"PL_{w.get('pl_number') or w['id']}")[:-4]
     # Сохранённое или введённое вручную имя тоже дополняем датой, без дубля.
     if date and date not in name:
         name += ' ' + date
     return _pdf_filename(name,
                          f"PL_{w.get('pl_number') or w['id']}")[:-4]
+
+
+@app.post('/retry-analysis/{job_id}')
+def retry_analysis(job_id: str):
+    w = waybills.get(job_id)
+    if not w:
+        raise HTTPException(status_code=404)
+    with _state_lock:
+        if w.get('processing'):
+            raise HTTPException(status_code=409, detail='Документ уже обрабатывается')
+        w['processing'] = True
+    try:
+        review = []
+        detected = detect_fields_with_ai(w['file_path'], review)
+        w['filled_on_scan'] = detected
+        w['review_fields'] = review
+        w.pop('detection_warning', None)
+        _apply_reverse_times(w)
+    except Exception as exc:
+        w['detection_warning'] = str(exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    finally:
+        w['processing'] = False
+        _save_state()
+    return {'ok': True}
 
 
 @app.post('/read-reverse/{job_id}')
@@ -2421,6 +2490,10 @@ def _render_waybill(w: dict) -> str:
         )
     else:
         scan_summary = '<div style="color:#aaa;font-size:12px;margin-bottom:10px">Анализ скана не выполнен</div>'
+    if not w.get('detection_warning'):
+        scan_summary += ('<button type="button" onclick="retryAnalysis(this)">Повторить анализ скана</button>'
+                         '<p style="font-size:11px;color:#666">Заново определяет пустые поля. '
+                         'Ручные отметки «Поле пустое» и несохранённые изменения будут сброшены.</p>')
 
     def day_row(i):
         def time_field(prefix, label):
@@ -2511,9 +2584,10 @@ def _render_waybill(w: dict) -> str:
         f'<input id="output-filename" name="output_filename" '
         f'value="{html.escape(_default_pdf_name(w), quote=True)}" '
         'style="width:100%;padding:8px;margin-top:5px" maxlength="160">'
-        '<p style="font-size:12px;color:#666">По умолчанию: заказчик и дата. '
-        'Номер техники при необходимости добавьте вручную, например: '
-        'КОРСТРОЙ ООО 48 ед 04,09. Расширение .pdf добавляется автоматически.</p>'
+        '<p style="font-size:12px;color:#666">По умолчанию: заказчик, номер техники '
+        'из обозначения СМ в 1С и даты смен, например: '
+        'КОРСТРОЙ ООО 48 ед 04-06,09. Введённое имя сохраняется без изменений. '
+        'Расширение .pdf добавляется автоматически.</p>'
     )
 
     fields_html += (
@@ -2573,7 +2647,8 @@ def _render_waybill(w: dict) -> str:
         detection_warn_block = (
             f'<div style="background:#fde2e2;border:2px solid #c00;border-radius:4px;'
             f'padding:9px;margin-bottom:10px;font-size:13px;color:#8b0000">'
-            f'⚠ {html.escape(str(w["detection_warning"]))}. Печать недоступна. Повторно загрузите скан для анализа.</div>'
+            f'⚠ {html.escape(str(w["detection_warning"]))}. Печать недоступна.'
+            f'<br><button type="button" onclick="retryAnalysis(this)">Повторить анализ скана</button></div>'
         )
 
     order_info = ""
@@ -2767,8 +2842,22 @@ function updateTimeSelection(select) {{
   input.dispatchEvent(new Event('input', {{bubbles:true}}));
 }}
 
+async function retryAnalysis(button) {{
+  button.disabled = true;
+  button.textContent = 'Анализируем…';
+  try {{
+    const response = await fetch('/retry-analysis/{w["id"]}', {{method:'POST'}});
+    if (!response.ok) throw new Error((await response.json()).detail || 'Ошибка анализа');
+    location.reload();
+  }} catch (error) {{
+    alert(error.message);
+    button.disabled = false;
+    button.textContent = 'Повторить анализ скана';
+  }}
+}}
+
 function updateOverlayVisibility() {{
-  var show = currentPage === 0 && !markupOn;
+  var show = currentPage === 0 && !markupOn && {str(not bool(w.get('detection_warning'))).lower()};
   document.querySelectorAll('.live-label').forEach(function(l) {{ l.style.display = show ? '' : 'none'; }});
   var any = show && document.querySelectorAll('.live-label.has-text').length > 0;
   document.getElementById('overlay-hint').classList.toggle('show', any);
@@ -2839,9 +2928,10 @@ switchPage(0);
     }});
     document.querySelectorAll('.centered-label').forEach(function(l) {{
       var scale = img.clientWidth / PAGE_W;
-      var size = (l.dataset.field === 'company_name' ? 8 : 9) * scale;
+      var size = (l.dataset.field === 'company_name' ? 8 : 7) * scale;
+      if (l.dataset.field === 'customer') l.style.marginTop = (-4 * img.clientWidth / {_TMPL_W}) + 'px';
       l.style.fontSize = size + 'px';
-      l.style.lineHeight = (11 * scale) + 'px';
+      l.style.lineHeight = ((l.dataset.field === 'customer' ? 7 : 11) * scale) + 'px';
       var context = document.createElement('canvas').getContext('2d');
       l.querySelectorAll('span').forEach(function(line) {{
         context.font = size + 'px Arial';
@@ -2862,7 +2952,7 @@ switchPage(0);
       if (label.classList.contains('centered-label')) {{
         var text = input.value;
         var lines = [text];
-        if (field === 'company_name') {{
+        if (field === 'company_name' || field === 'customer') {{
           text = text.trim().split(/\s+/).join(' ');
           var spaces = [];
           for (var i = 0; i < text.length; i++) if (text[i] === ' ') spaces.push(i);

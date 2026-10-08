@@ -26,7 +26,7 @@ class ShiftTimesTests(unittest.TestCase):
         with patch.object(app, 'AI_API_KEY', 'test'), \
                 patch.object(app.requests, 'post', return_value=response) as post:
             detected = app.detect_fields_with_ai(str(app.TEMPLATE_PATH), review)
-        content = post.call_args.kwargs['json']['messages'][0]['content']
+        content = post.call_args.kwargs['json']['messages'][-1]['content']
         self.assertEqual(sum(item['type'] == 'image_url' for item in content), 12)
         self.assertEqual(review, ['time_in_1'])
         self.assertTrue(detected['time_in_1'])
