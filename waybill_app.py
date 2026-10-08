@@ -1318,7 +1318,7 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
             continue
         if field == "customer":
             for i, line in enumerate(_organization_lines(val)):
-                ins_centered(field, line, eff[1] - 4 + i * 7, 7)
+                ins_centered(field, line, eff[1] - 4 + i * 7.5, 7.5)
             continue
         if field.startswith('work_object_'):
             x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
@@ -2928,10 +2928,10 @@ switchPage(0);
     }});
     document.querySelectorAll('.centered-label').forEach(function(l) {{
       var scale = img.clientWidth / PAGE_W;
-      var size = (l.dataset.field === 'company_name' ? 8 : 7) * scale;
+      var size = (l.dataset.field === 'company_name' ? 8 : 7.5) * scale;
       if (l.dataset.field === 'customer') l.style.marginTop = (-4 * img.clientWidth / {_TMPL_W}) + 'px';
       l.style.fontSize = size + 'px';
-      l.style.lineHeight = ((l.dataset.field === 'customer' ? 7 : 11) * scale) + 'px';
+      l.style.lineHeight = ((l.dataset.field === 'customer' ? 7.5 : 11) * scale) + 'px';
       var context = document.createElement('canvas').getContext('2d');
       l.querySelectorAll('span').forEach(function(line) {{
         context.font = size + 'px Arial';
