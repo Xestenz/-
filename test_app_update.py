@@ -8,6 +8,12 @@ from app_update import update_checkout
 
 
 class UpdateTests(unittest.TestCase):
+    def test_disabled_folder_watch_never_starts_observer(self):
+        import waybill_app as app
+        with patch.object(app, 'WATCH_SCAN_FOLDER', False), patch.object(app, 'Observer') as observer:
+            self.assertIsNone(app.start_watcher())
+            observer.assert_not_called()
+
     def test_preserves_existing_ssh_configuration(self):
         for configured in (None, 'custom-ssh -i employee-key'):
             env = {} if configured is None else {'GIT_SSH_COMMAND': configured}

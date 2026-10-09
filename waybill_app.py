@@ -57,8 +57,11 @@ def _load_env():
 _load_env()
 
 SCAN_FOLDER   = os.environ.get("SCAN_FOLDER", r"C:\Scans")
-OUTPUT_FOLDER = os.environ.get('OUTPUT_FOLDER', str(Path(__file__).parent / 'completed'))
+OUTPUT_FOLDER = os.environ.get('OUTPUT_FOLDER', '').strip() or SCAN_FOLDER
 OUTPUT_MIRROR_FOLDER = os.environ.get('OUTPUT_MIRROR_FOLDER', '')
+WATCH_SCAN_FOLDER = os.environ.get('WATCH_SCAN_FOLDER', '0').strip().lower() in ('1', 'true', 'yes')
+UPDATE_ON_START = os.environ.get('UPDATE_ON_START', '1').strip().lower() in ('1', 'true', 'yes')
+_startup_update_message = ''
 _intake_lock = threading.RLock()
 _state_lock = threading.RLock()
 SCAN_WORKERS = max(1, min(4, int(os.environ.get('SCAN_WORKERS', '2'))))
@@ -1757,6 +1760,8 @@ async def index():
         has_queue='true' if queue else 'false',
         group_action=group_action,
         update_token=_update_token,
+        startup_update_message=html.escape(_startup_update_message),
+        watch_status='включено — новые сканы обрабатываются автоматически' if WATCH_SCAN_FOLDER else 'выключено — используйте «Выбрать сканы»',
     ))
 
 
@@ -2409,7 +2414,7 @@ a:hover{{text-decoration:underline}}
 <header class="page-header"><div><h1>Путевые листы ЭСМ-2</h1><p>Загрузите сканы, проверьте данные и подготовьте печать.</p></div>
 <div class="tools"><a class="btn" href="/guide" target="_blank" rel="noopener">Инструкция сотруднику</a>
 <button class="btn" type="button" id="update-app" onclick="updateApp()" title="Перед обновлением сохраните правки во всех путевых">Обновить программу</button></div></header>
-<p id="update-message" role="status" style="white-space:pre-wrap"></p>
+<p id="update-message" role="status" style="white-space:pre-wrap">{startup_update_message}</p>
 <script>
 async function updateApp() {{
   const button = document.getElementById('update-app'), message = document.getElementById('update-message');
@@ -2431,7 +2436,7 @@ async function updateApp() {{
   }} catch (error) {{ message.textContent = error.message; button.disabled = false; }}
 }}
 </script>
-<details class="folder-info"><summary>Папки сканирования и сохранения</summary><p>Автоматическое наблюдение: <code>{scan_folder}</code></p>
+<details class="folder-info"><summary>Папки сканирования и сохранения</summary><p>Наблюдение за папкой: {watch_status}</p><p>Папка сканов: <code>{scan_folder}</code></p>
 <p>Готовые PDF: <code>{output_folder}</code><br>Вторая копия: <code>{mirror_folder}</code></p></details>
 <div class="stats">
   <div class="stat"><div class="num">{count_pending}</div><p>Ожидают обработки</p></div>
@@ -2460,7 +2465,7 @@ async function updateApp() {{
   <tbody>{rows}</tbody>
 </table>
 </form>
-<p class="tip">Или просто положите скан в папку <strong>{scan_folder}</strong> — браузер откроется автоматически.</p>
+<p class="tip">Обработка выбранных сканов начинается после загрузки. Наблюдение за папкой: {watch_status}.</p>
 <script>
 if ({has_queue}) setTimeout(() => {{
   if (!document.querySelector('input[name="jobs"]:checked')) location.reload();
@@ -3252,6 +3257,9 @@ async function printWaybill(mode, btn, download = false) {{
 # ---------------------------------------------------------------------------
 
 def start_watcher():
+    if not WATCH_SCAN_FOLDER:
+        log.info('Автоматическое наблюдение выключено. Обработка только при ручной загрузке.')
+        return None
     scan_path = Path(SCAN_FOLDER)
     if not scan_path.exists():
         log.warning("Папка сканера не найдена: %s — создаём", SCAN_FOLDER)
@@ -3264,6 +3272,19 @@ def start_watcher():
 
 
 if __name__ == "__main__":
+    skip_update = os.environ.pop('WAYBILL_SKIP_UPDATE_ONCE', '')
+    if UPDATE_ON_START and not skip_update:
+        try:
+            changed, version = update_checkout(Path(__file__).parent)
+            _startup_update_message = 'Проверка при запуске: установлена версия ' + version
+            if changed:
+                os.environ['WAYBILL_SKIP_UPDATE_ONCE'] = version
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
+        except Exception as exc:
+            log.warning('Обновление при запуске не удалось: %s', exc)
+            _startup_update_message = 'Не удалось обновиться при запуске. Программа работает в прежней версии. ' + str(exc)
+    elif skip_update:
+        _startup_update_message = 'Программа обновлена. Версия ' + skip_update
     _load_state()
     _load_field_overrides()
     observer = start_watcher()
@@ -3276,7 +3297,9 @@ if __name__ == "__main__":
         _server = uvicorn.Server(uvicorn.Config(app, host=WEB_HOST, port=WEB_PORT, log_level="warning"))
         _server.run()
     finally:
-        observer.stop()
-        observer.join()
+        if observer is not None:
+            observer.stop()
+            observer.join()
     if _restart_requested:
+        os.environ['WAYBILL_SKIP_UPDATE_ONCE'] = 'после ручного обновления'
         os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
