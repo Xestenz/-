@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from app_update import update_checkout
 import re
 from urllib.parse import quote
 import webbrowser
@@ -1643,6 +1644,69 @@ def _empty_fields() -> dict:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Путевые листы ЭСМ-2")
+_update_token = uuid.uuid4().hex
+_updating = False
+_active_requests = 0
+_restart_requested = False
+_server = None
+
+
+@app.middleware('http')
+async def update_guard(request, call_next):
+    global _active_requests
+    exempt = request.url.path in ('/update-app', '/update-status')
+    with _state_lock:
+        if _updating and not exempt:
+            return JSONResponse({'detail': 'Программа обновляется. Подождите перезапуска.'}, status_code=503)
+        if not exempt:
+            _active_requests += 1
+    try:
+        return await call_next(request)
+    finally:
+        if not exempt:
+            with _state_lock:
+                _active_requests -= 1
+
+
+@app.get('/update-status')
+def update_status():
+    return {'ready': not _updating}
+
+
+def _finish_update():
+    # Scans arriving during Git download are allowed to finish before restart.
+    with _state_lock:
+        busy = bool(_queued_paths) or any(w.get('processing') for w in waybills.values())
+    if busy:
+        threading.Timer(2, _finish_update).start()
+    elif _server is not None:
+        _server.should_exit = True
+
+
+@app.post('/update-app')
+def update_app(request: Request):
+    global _updating, _restart_requested
+    if request.headers.get('X-Update-Token') != _update_token:
+        raise HTTPException(status_code=403, detail='Обновите главную страницу и повторите.')
+    with _state_lock:
+        if _updating or _active_requests or _queued_paths or any(w.get('processing') for w in waybills.values()):
+            raise HTTPException(status_code=409, detail='Дождитесь завершения обработки и печати документов.')
+        if _server is None:
+            raise HTTPException(status_code=409, detail='Для обновления запустите приложение командой python waybill_app.py.')
+        _updating = True
+    try:
+        changed, version = update_checkout(Path(__file__).parent)
+        if changed:
+            _save_state()
+            _restart_requested = True
+            threading.Timer(2, _finish_update).start()
+        else:
+            _updating = False
+        return {'restart': changed, 'message': ('Обновление установлено. Ожидайте перезапуска. Версия ' if changed else 'Установлена последняя версия: ') + version}
+    except Exception as exc:
+        _updating = False
+        log.exception('Ошибка обновления приложения')
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1686,6 +1750,7 @@ async def index():
         queue_html=''.join('<li>' + html.escape(Path(path).name + ': ' + status) + '</li>' for path, status in queue),
         has_queue='true' if queue else 'false',
         group_action=group_action,
+        update_token=_update_token,
     ))
 
 
@@ -2306,6 +2371,30 @@ a:hover{{text-decoration:underline}}
 </head>
 <body>
 <h1>Обработка путевых листов ЭСМ-2</h1>
+<button class="btn" type="button" id="update-app" onclick="updateApp()">Обновить программу</button>
+<p style="color:#666">Перед обновлением сохраните изменения в открытых путевых листах.</p>
+<p id="update-message" role="status" style="white-space:pre-wrap"></p>
+<script>
+async function updateApp() {{
+  const button = document.getElementById('update-app'), message = document.getElementById('update-message');
+  button.disabled = true; message.textContent = 'Проверяем и загружаем обновление…';
+  try {{
+    const response = await fetch('/update-app', {{method:'POST', headers:{{'X-Update-Token':'{update_token}'}}}});
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.detail || 'Не удалось обновить программу');
+    message.textContent = result.message;
+    if (!result.restart) {{ button.disabled = false; return; }}
+    for (let i=0; i<90; i++) {{
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      try {{
+        const status = await fetch('/update-status', {{cache:'no-store'}});
+        if (status.ok && (await status.json()).ready) {{ location.reload(); return; }}
+      }} catch (_) {{}}
+    }}
+    message.textContent += '\\nПерезапуск ещё не завершён. Подождите и обновите страницу. Если программа закрылась, запустите её обычным способом.';
+  }} catch (error) {{ message.textContent = error.message; button.disabled = false; }}
+}}
+</script>
 <p class="subtitle">Мониторинг папки: <code>{scan_folder}</code> &nbsp;·&nbsp; <a href="/">Обновить список</a></p>
 <p>Готовые PDF: <code>{output_folder}</code><br>Вторая копия: <code>{mirror_folder}</code></p>
 <div class="stats">
@@ -3144,7 +3233,10 @@ if __name__ == "__main__":
     threading.Timer(1.5, lambda: webbrowser.open(f"http://{WEB_HOST}:{WEB_PORT}")).start()
 
     try:
-        uvicorn.run(app, host=WEB_HOST, port=WEB_PORT, log_level="warning")
+        _server = uvicorn.Server(uvicorn.Config(app, host=WEB_HOST, port=WEB_PORT, log_level="warning"))
+        _server.run()
     finally:
         observer.stop()
         observer.join()
+    if _restart_requested:
+        os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve())])
