@@ -2412,7 +2412,7 @@ a:hover{{text-decoration:underline}}
 </head>
 <body>
 <header class="page-header"><div><h1>Путевые листы ЭСМ-2</h1><p>Загрузите сканы, проверьте данные и подготовьте печать.</p></div>
-<div class="tools"><a class="btn" href="/guide" target="_blank" rel="noopener">Инструкция сотруднику</a>
+<div class="tools"><a class="btn" href="/guide" target="_blank" rel="noopener">Инструкция</a>
 <button class="btn" type="button" id="update-app" onclick="updateApp()" title="Перед обновлением сохраните правки во всех путевых">Обновить программу</button></div></header>
 <p id="update-message" role="status" style="white-space:pre-wrap">{startup_update_message}</p>
 <script>
