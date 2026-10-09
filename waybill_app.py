@@ -525,7 +525,7 @@ SCAN_FIELDS: dict[str, tuple] = {
     "work_date_2":     (725,  75, 754,  92,   None,  None),  # ММ
     "work_date_3":     (754,  74, 782,  90,   None,  None),  # ГГГГ
     "company_name":    ( 61,  86, 638, 110,   None,  None),  # Организация
-    "customer":        ( 93, 109, 636, 132,   103,   126),
+    "customer":        ( 80, 109, 646, 132,   103,   126),
     "vehicle_type":    ( 52, 136, 272, 156,    72,   156),
     "vehicle_plate":   (423, 136, 662, 157,   436,   150),
     "driver_name":     ( 54, 162, 395, 193,    63,   178),
@@ -1254,6 +1254,8 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         if width > available:
             fsize *= available / width
             width = available
+        if field == 'customer' and fsize < 7.5 - 0.001:
+            raise ValueError('Реквизиты заказчика не помещаются при минимальном шрифте 7,5 пт. Сократите текст поля «Заказчик», сохранив необходимые реквизиты.')
         xp, yp = _tmpl_to_scan_pt((x0 + x1) / 2, y, sw, sh)
         xd, yd = _raw_to_disp_pt(xp, yp, sw, sh)
         xp, yp = _disp_to_raw_pt(xd - width / 2, yd, sw, sh)
@@ -1317,8 +1319,8 @@ def _fill_scan_pdf_impl(scan_path: str, fields: dict, filled_on_scan: dict, *, a
         if not val:
             continue
         if field == "customer":
-            for i, line in enumerate(_organization_lines(val)):
-                ins_centered(field, line, eff[1] - 4 + i * 7.5, 7.5)
+            for i, line in enumerate(_customer_lines(val)):
+                ins_centered(field, line, eff[1] - 4 + i * 8, 8)
             continue
         if field.startswith('work_object_'):
             x0, y0, x1, y1 = SCAN_FIELDS[field][:4]
@@ -1585,6 +1587,16 @@ def _save_completed(w, data, filename):
         w['source_replaced'] = True
         return paths
     return archive_pdf(data, filename, w['id'], OUTPUT_FOLDER, OUTPUT_MIRROR_FOLDER)
+
+
+def _customer_lines(text: str) -> list[str]:
+    text = ' '.join(text.split())
+    spaces = [i for i, char in enumerate(text) if char == ' ']
+    if not spaces:
+        return [text] if text else []
+    font = fitz.Font(fontfile=_FONT)
+    split = min(spaces, key=lambda i: max(font.text_length(text[:i]), font.text_length(text[i + 1:])))
+    return [text[:split], text[split + 1:]]
 
 
 def _organization_lines(text: str) -> list[str]:
@@ -2584,6 +2596,10 @@ def _render_waybill(w: dict) -> str:
         f'<input id="output-filename" name="output_filename" '
         f'value="{html.escape(_default_pdf_name(w), quote=True)}" '
         'style="width:100%;padding:8px;margin-top:5px" maxlength="160">'
+        '<button type="button" onclick="document.getElementById(\'output-filename\').value='
+        + html.escape(json.dumps(_default_pdf_name({**w, 'fields': {**f, 'output_filename': ''}})), quote=True)
+        + '">Сформировать имя по данным 1С</button>'
+        +
         '<p style="font-size:12px;color:#666">По умолчанию: заказчик, номер техники '
         'из обозначения СМ в 1С и даты смен, например: '
         'КОРСТРОЙ ООО 48 ед 04-06,09. Введённое имя сохраняется без изменений. '
@@ -2928,16 +2944,21 @@ switchPage(0);
     }});
     document.querySelectorAll('.centered-label').forEach(function(l) {{
       var scale = img.clientWidth / PAGE_W;
-      var size = (l.dataset.field === 'company_name' ? 8 : 7.5) * scale;
+      var size = 8 * scale;
       if (l.dataset.field === 'customer') l.style.marginTop = (-4 * img.clientWidth / {_TMPL_W}) + 'px';
       l.style.fontSize = size + 'px';
-      l.style.lineHeight = ((l.dataset.field === 'customer' ? 7.5 : 11) * scale) + 'px';
+      l.style.lineHeight = ((l.dataset.field === 'customer' ? 8 : 11) * scale) + 'px';
       var context = document.createElement('canvas').getContext('2d');
       l.querySelectorAll('span').forEach(function(line) {{
         context.font = size + 'px Arial';
         var width = context.measureText(line.textContent).width;
         var available = img.clientWidth * Number(l.dataset.width) / 100;
-        line.style.fontSize = (width > available ? size * available / width : size) + 'px';
+        var fitted = width > available ? size * available / width : size;
+        var overflow = l.dataset.field === 'customer' && fitted < 7.5 * scale - 0.001;
+        if (l.dataset.field === 'customer') fitted = Math.max(7.5 * scale, fitted);
+        line.style.fontSize = fitted + 'px';
+        line.style.color = overflow ? '#b00020' : '';
+        line.title = overflow ? 'Текст не помещается при шрифте 7,5 пт. Сократите реквизиты заказчика.' : '';
       }});
     }});
   }}
@@ -2958,6 +2979,12 @@ switchPage(0);
           for (var i = 0; i < text.length; i++) if (text[i] === ' ') spaces.push(i);
           if (spaces.length) {{
             var middle = spaces.reduce((a, b) => Math.abs(a - text.length / 2) <= Math.abs(b - text.length / 2) ? a : b);
+            if (field === 'customer') {{
+              const ctx = document.createElement('canvas').getContext('2d');
+              ctx.font = '8px Arial';
+              const widthAt = i => Math.max(ctx.measureText(text.slice(0, i)).width, ctx.measureText(text.slice(i + 1)).width);
+              middle = spaces.reduce((a, b) => widthAt(a) <= widthAt(b) ? a : b);
+            }}
             lines = [text.slice(0, middle), text.slice(middle + 1)];
           }} else {{ lines = [text]; }}
         }}

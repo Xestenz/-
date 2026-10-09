@@ -51,7 +51,18 @@ class ScanRegressions(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             for line in lines:
                 for span in line['spans']:
-                    self.assertGreaterEqual(span['size'], 6)
+                    self.assertGreaterEqual(span['size'], 7.5)
+
+    def test_customer_never_shrinks_below_readable_size(self):
+        with self.assertRaisesRegex(ValueError, '7,5'):
+            app.fill_scan_pdf(str(app.TEMPLATE_PATH), {'customer': 'Длинные реквизиты ' * 150},
+                              dict.fromkeys(app.SCAN_FIELDS, False), additions_only=True)
+
+    def test_garage_number_is_not_vehicle_quantity(self):
+        fields = {'customer_short_name': 'Заказчик', 'vehicle_type': 'JCB см01',
+                  'api_shift_rows': [{'date': '09.10.2026'}]}
+        self.assertEqual(app._default_pdf_name({'id': 'test', 'fields': fields}),
+                         'Заказчик 1 ед 09,10')
 
 
 if __name__ == '__main__':
