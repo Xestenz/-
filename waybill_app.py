@@ -1673,6 +1673,12 @@ def update_status():
     return {'ready': not _updating}
 
 
+@app.get('/guide', response_class=FileResponse)
+def employee_guide():
+    return FileResponse(Path(__file__).parent / 'employee_guide.html', media_type='text/html',
+                        headers={'Cache-Control': 'no-cache'})
+
+
 def _finish_update():
     # Scans arriving during Git download are allowed to finish before restart.
     with _state_lock:
@@ -2371,6 +2377,7 @@ a:hover{{text-decoration:underline}}
 </head>
 <body>
 <h1>Обработка путевых листов ЭСМ-2</h1>
+<p><a href="/guide" target="_blank" rel="noopener">Инструкция сотруднику — все возможности и кнопки</a></p>
 <button class="btn" type="button" id="update-app" onclick="updateApp()">Обновить программу</button>
 <p style="color:#666">Перед обновлением сохраните изменения в открытых путевых листах.</p>
 <p id="update-message" role="status" style="white-space:pre-wrap"></p>
