@@ -2373,13 +2373,42 @@ tr:last-child td{{border-bottom:none}}
 a{{color:#2980b9;text-decoration:none;font-weight:600}}
 a:hover{{text-decoration:underline}}
 .tip{{color:#aaa;font-size:12px;margin-top:15px}}
+.page-header{{display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap;margin-bottom:24px}}
+.page-header h1{{font-size:28px;margin:0 0 8px}}
+.page-header p{{margin:0;color:#64748b}}
+.tools{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+.btn{{background:#fff;color:#334155;border:1px solid #cbd5e1;min-height:44px;transition:background .15s}}
+.btn:hover{{background:#eaf1f8}}
+.btn-green{{background:#16834d;color:#fff;border-color:#16834d}}
+.btn-green:hover{{background:#12683e}}
+.btn:disabled{{opacity:.55;cursor:wait}}
+.btn:focus-visible,.upload-label:focus-within,a:focus-visible{{outline:3px solid #60a5fa;outline-offset:3px}}
+.workspace{{background:#fff;border:1px solid #dce4ed;border-radius:16px;padding:24px;margin:20px 0}}
+.workspace h2{{margin:0 0 8px;font-size:21px}}
+.workspace p{{color:#64748b;margin:0 0 20px}}
+.workspace .actions{{margin:0;gap:16px}}
+.workspace form{{margin:0}}
+.upload-label{{position:relative;background:#2563eb;padding:16px 26px;font-size:16px;border-radius:10px}}
+.upload-label:hover{{background:#1d4ed8}}
+#upload-input{{display:block;position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}}
+.stats{{margin:0;gap:12px;flex-wrap:wrap}}
+.stat{{display:flex;align-items:center;gap:12px;padding:12px 18px;box-shadow:none;border:1px solid #e2e8f0}}
+.stat .num{{font-size:25px;color:#475569}}
+.stat p{{margin:0}}
+.folder-info{{color:#64748b;font-size:13px;margin:18px 0}}
+.folder-info summary,.batch-options summary{{cursor:pointer;padding:10px 0}}
+.folder-info code{{overflow-wrap:anywhere}}
+.batch-options{{margin:16px 0}}
+.batch-options .tools{{margin:12px 0}}
+#update-message:empty{{display:none}}
+#update-message:not(:empty){{padding:14px;background:#eaf1ff;border-radius:8px}}
+@media(max-width:650px){{body{{margin:16px}}.workspace{{padding:18px}}.page-header h1{{font-size:24px}}.actions>*,.actions form .btn{{width:100%;box-sizing:border-box}}table{{display:block;overflow-x:auto}}}}
 </style>
 </head>
 <body>
-<h1>Обработка путевых листов ЭСМ-2</h1>
-<p><a href="/guide" target="_blank" rel="noopener">Инструкция сотруднику — все возможности и кнопки</a></p>
-<button class="btn" type="button" id="update-app" onclick="updateApp()">Обновить программу</button>
-<p style="color:#666">Перед обновлением сохраните изменения в открытых путевых листах.</p>
+<header class="page-header"><div><h1>Путевые листы ЭСМ-2</h1><p>Загрузите сканы, проверьте данные и подготовьте печать.</p></div>
+<div class="tools"><a class="btn" href="/guide" target="_blank" rel="noopener">Инструкция сотруднику</a>
+<button class="btn" type="button" id="update-app" onclick="updateApp()" title="Перед обновлением сохраните правки во всех путевых">Обновить программу</button></div></header>
 <p id="update-message" role="status" style="white-space:pre-wrap"></p>
 <script>
 async function updateApp() {{
@@ -2402,27 +2431,31 @@ async function updateApp() {{
   }} catch (error) {{ message.textContent = error.message; button.disabled = false; }}
 }}
 </script>
-<p class="subtitle">Мониторинг папки: <code>{scan_folder}</code> &nbsp;·&nbsp; <a href="/">Обновить список</a></p>
-<p>Готовые PDF: <code>{output_folder}</code><br>Вторая копия: <code>{mirror_folder}</code></p>
+<details class="folder-info"><summary>Папки сканирования и сохранения</summary><p>Автоматическое наблюдение: <code>{scan_folder}</code></p>
+<p>Готовые PDF: <code>{output_folder}</code><br>Вторая копия: <code>{mirror_folder}</code></p></details>
 <div class="stats">
   <div class="stat"><div class="num">{count_pending}</div><p>Ожидают обработки</p></div>
   <div class="stat ok"><div class="num">{count_confirmed}</div><p>Подтверждено</p></div>
 </div>
 <ul>{queue_html}</ul>
-{group_action}
+<section class="workspace"><h2>Загрузить путевые</h2><p>Выберите один или несколько сканов. После загрузки начнётся обработка.</p>
 <div class="actions">
   <label class="upload-label">
-    ↑ Загрузить файлы вручную
+    + Выбрать сканы
     <input type="file" id="upload-input" multiple accept=".pdf,.jpg,.jpeg,.png,.tif,.tiff" onchange="uploadFiles(this.files)">
   </label>
-  <span id="msg"></span>
-</div>
+  {group_action}
+</div><div id="msg" role="status"></div></section>
+<div class="tools"><h2 style="margin:0">Документы</h2><a href="/">Обновить список</a></div>
 <form method="post" action="/batch-print" target="_blank">
+<details class="batch-options"><summary>Печать выбранных документов</summary>
 <p>Для другой подборки можно отметить документы ниже. Пакет использует сохранённые значения полей.</p>
+<div class="tools">
 <button class="btn btn-green" type="submit" name="print_mode" value="additions">Допечатать выбранные оригиналы</button>
 <button class="btn" type="submit" name="print_mode" value="copy">Полные копии выбранных</button>
+</div>
 <p>Порядок: по номеру путевого, затем по имени файла. Для допечатки: одна лицевая сторона на документ, масштаб 100%, односторонняя печать. Порядок также указан в закладках PDF.</p>
-<table>
+</details><table>
   <thead><tr><th>Выбор</th><th>Время</th><th>Файл</th><th>№ Путевого</th><th>Действие</th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
