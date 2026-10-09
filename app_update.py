@@ -7,8 +7,9 @@ from pathlib import Path
 def update_checkout(root):
     root = Path(root)
     def git(*args):
-        env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0',
-               'GIT_SSH_COMMAND': 'ssh -o BatchMode=yes -o ConnectTimeout=15'}
+        # Preserve the SSH executable, identity and agent configured for normal
+        # git pull (including core.sshCommand and inherited GIT_SSH_COMMAND).
+        env = {**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
         result = subprocess.run(['git', *args], cwd=root, env=env,
                                 capture_output=True, text=True, encoding='utf-8', errors='replace',
                                 timeout=120, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))

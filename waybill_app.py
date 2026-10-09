@@ -3012,7 +3012,7 @@ switchPage(0);
     document.querySelectorAll('.live-label').forEach(function(l) {{ l.style.fontSize = px + 'px'; }});
     document.querySelectorAll('.object-label').forEach(function(l) {{
       const input = document.querySelector('#frm input[name="' + l.dataset.field + '"]');
-      const text = (input?.value || '').trim().replace(/\s+/g, ' ');
+      const text = (input?.value || '').trim().replace(/\\s+/g, ' ');
       const ctx = document.createElement('canvas').getContext('2d');
       const width = Number(l.dataset.cellWidth), height = Number(l.dataset.cellHeight);
       let size = 9, lines;
@@ -3070,7 +3070,7 @@ switchPage(0);
         var text = input.value;
         var lines = [text];
         if (field === 'company_name' || field === 'customer') {{
-          text = text.trim().split(/\s+/).join(' ');
+          text = text.trim().split(/\\s+/).join(' ');
           var spaces = [];
           for (var i = 0; i < text.length; i++) if (text[i] === ' ') spaces.push(i);
           if (spaces.length) {{
@@ -3174,7 +3174,7 @@ async function printWaybill(mode, btn, download = false) {{
     const blob = await resp.blob();
     const url  = URL.createObjectURL(blob);
     const disposition = resp.headers.get('Content-Disposition') || '';
-    const match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+    const match = disposition.match(/filename\\*=UTF-8''([^;]+)/i);
     const filename = match ? decodeURIComponent(match[1]) : 'waybill.pdf';
     if (download === 'group') {{
       URL.revokeObjectURL(url);

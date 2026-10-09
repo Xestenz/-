@@ -1,4 +1,5 @@
 import subprocess
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,6 +8,20 @@ from app_update import update_checkout
 
 
 class UpdateTests(unittest.TestCase):
+    def test_preserves_existing_ssh_configuration(self):
+        for configured in (None, 'custom-ssh -i employee-key'):
+            env = {} if configured is None else {'GIT_SSH_COMMAND': configured}
+            results = [Mock(returncode=0, stdout=value, stderr='')
+                       for value in ('main', '', 'abc', '', 'abc')]
+            with patch.dict(os.environ, env, clear=True), \
+                    patch('app_update.subprocess.run', side_effect=results) as run:
+                self.assertFalse(update_checkout('.')[0])
+            for call in run.call_args_list:
+                actual = call.kwargs['env']
+                self.assertEqual(actual.get('GIT_SSH_COMMAND'), configured)
+                if configured is None:
+                    self.assertNotIn('GIT_SSH_COMMAND', actual)
+
     def test_restart_is_scheduled_only_after_successful_update(self):
         import waybill_app as app
         request = Mock(headers={'X-Update-Token': app._update_token})
