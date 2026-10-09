@@ -58,7 +58,7 @@ _load_env()
 
 SCAN_FOLDER   = os.environ.get("SCAN_FOLDER", r"C:\Scans")
 OUTPUT_FOLDER = os.environ.get('OUTPUT_FOLDER', '').strip() or SCAN_FOLDER
-OUTPUT_MIRROR_FOLDER = os.environ.get('OUTPUT_MIRROR_FOLDER', '')
+OUTPUT_MIRROR_FOLDER = os.environ.get('OUTPUT_MIRROR_FOLDER', '').strip() or r'\\NASCCM\p_scan'
 WATCH_SCAN_FOLDER = os.environ.get('WATCH_SCAN_FOLDER', '0').strip().lower() in ('1', 'true', 'yes')
 UPDATE_ON_START = os.environ.get('UPDATE_ON_START', '1').strip().lower() in ('1', 'true', 'yes')
 _startup_update_message = ''
