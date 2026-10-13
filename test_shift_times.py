@@ -54,7 +54,8 @@ class ShiftTimesTests(unittest.TestCase):
             request = Mock()
             request.form = AsyncMock(return_value=form)
             with patch.object(app, 'waybills', {'test': entry}), \
-                    patch.object(app, '_save_state'), patch.object(app, '_auto_calibrate'):
+                    patch.object(app, '_save_state'), patch.object(app, '_auto_calibrate'), \
+                    patch.object(app, '_save_completed', return_value=[]):
                 response = asyncio.run(app.print_waybill('test', request))
             self.assertEqual(entry['filled_on_scan']['time_out_1'], not allow)
             self.assertEqual(entry['fields']['time_out_1'], '09:00')
