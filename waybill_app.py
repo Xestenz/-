@@ -1583,6 +1583,19 @@ def _prepare_source(w):
             cached = preserve_source(path, Path(__file__).parent / 'uploads' / 'source_cache')
             w.update(original_path=path, file_path=cached, replace_source=True)
             _save_state()
+    if not w.get('replace_source'):
+        # Browser uploads have no original full path. Match only the exact
+        # basename in the configured inbox and verify the complete contents.
+        uploaded_name = Path(w.get('original_path') or w.get('file_name') or '').name
+        name = re.sub(r'^[0-9a-f]{8}_', '', uploaded_name)
+        candidate = Path(SCAN_FOLDER) / name
+        cached = Path(w['file_path'])
+        if name and candidate.is_file() and _in_scan_folder(candidate):
+            if hashlib.sha256(candidate.read_bytes()).digest() == hashlib.sha256(cached.read_bytes()).digest():
+                if os.path.samefile(candidate, cached):
+                    cached = Path(preserve_source(str(cached), Path(__file__).parent / 'uploads' / 'source_cache'))
+                w.update(original_path=str(candidate), file_path=str(cached), replace_source=True)
+                _save_state()
 
 
 def _save_completed(w, data, filename):
@@ -1773,14 +1786,15 @@ async def upload_file(request: Request):
     if not file:
         raise HTTPException(status_code=400, detail="Файл не передан")
 
-    suffix = Path(file.filename).suffix.lower()
+    upload_name = str(file.filename or '').replace('\\', '/').rsplit('/', 1)[-1]
+    suffix = Path(upload_name).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
         raise HTTPException(status_code=400, detail=f"Формат не поддерживается: {suffix}")
 
     # сохраняем во временную папку рядом со скриптом
     save_dir = Path(__file__).parent / "uploads"
     save_dir.mkdir(exist_ok=True)
-    save_path = save_dir / f"{uuid.uuid4().hex[:8]}_{file.filename}"
+    save_path = save_dir / f"{uuid.uuid4().hex[:8]}_{upload_name}"
     save_path.write_bytes(await file.read())
 
     _enqueue_scan(str(save_path), batch_id=str(form.get('batch_id') or uuid.uuid4().hex))

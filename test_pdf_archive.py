@@ -11,6 +11,34 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_manual_upload_replaces_matching_inbox_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox = root / 'inbox'; inbox.mkdir()
+            source = inbox / 'scan.pdf'; source.write_bytes(b'original')
+            upload = root / 'abcdef12_scan.pdf'; upload.write_bytes(b'original')
+            mirror = root / 'mirror'
+            entry = {'id': 'manual', 'original_path': str(upload), 'file_path': str(upload)}
+            with patch.object(app, 'SCAN_FOLDER', str(inbox)), patch.object(app, 'OUTPUT_MIRROR_FOLDER', str(mirror)), patch.object(app, '_save_state'):
+                app._prepare_source(entry)
+                paths = app._save_completed(entry, b'completed', 'Client.pdf')
+            self.assertFalse(source.exists())
+            self.assertEqual(upload.read_bytes(), b'original')
+            self.assertEqual(len(paths), 2)
+            self.assertTrue(all(Path(p).read_bytes() == b'completed' for p in paths))
+
+    def test_manual_upload_does_not_replace_different_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inbox = root / 'inbox'; inbox.mkdir()
+            source = inbox / 'scan.pdf'; source.write_bytes(b'new scan')
+            upload = root / 'abcdef12_scan.pdf'; upload.write_bytes(b'old scan')
+            entry = {'original_path': str(upload), 'file_path': str(upload)}
+            with patch.object(app, 'SCAN_FOLDER', str(inbox)), patch.object(app, '_save_state'):
+                app._prepare_source(entry)
+            self.assertFalse(entry.get('replace_source', False))
+            self.assertEqual(source.read_bytes(), b'new scan')
+
     def test_additions_batch_archives_only_additions(self):
         entries = {key: {'id': key, 'file_name': key, 'pl_number': number,
             'file_path': str(app.TEMPLATE_PATH), 'fields': {'work_date': '07.10.2026', 'time_out_1': '09:00'},
