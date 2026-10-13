@@ -8,6 +8,11 @@ import waybill_app as app
 
 
 class ShiftTimesTests(unittest.TestCase):
+    def setUp(self):
+        check = patch.object(app, '_check_legacy_order_selection', return_value=False)
+        check.start()
+        self.addCleanup(check.stop)
+
     def test_long_object_address_stays_inside_cell(self):
         font = fitz.Font(fontfile=app._FONT)
         for text in ('г Москва, ул Суворовская, д 6 стр 14', 'ОченьДлинноеСловоБезПробелов' * 5):

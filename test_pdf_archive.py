@@ -11,6 +11,11 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def setUp(self):
+        check = patch.object(app, '_check_legacy_order_selection', return_value=False)
+        check.start()
+        self.addCleanup(check.stop)
+
     def test_single_additions_returns_overlay_but_archives_both_original_pages(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'source.pdf'

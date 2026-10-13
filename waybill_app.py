@@ -34,7 +34,7 @@ import pypdfium2 as pdfium
 import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, RedirectResponse
 from PIL import Image
 from pyzbar import pyzbar
 from watchdog.events import FileSystemEventHandler
@@ -357,7 +357,80 @@ def _merge_shift_times(fields: dict, rows: list[dict]) -> None:
     fields['api_time_version'] = 1
 
 
-def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
+def _order_groups(records):
+    groups = {}
+    for row in records:
+        key = (str(row.get('НомерЗаказа') or ''), str(row.get('КлиентКод') or row.get('КлиентНаименование') or ''),
+               str(row.get('МашинаНаименование') or ''))
+        groups.setdefault(key, []).append(row)
+    return list(groups.values())
+
+
+def _match_scan_dates(groups, reverse_rows):
+    # No partial matching: every detected row must have a confident date.
+    if not reverse_rows or any(not row.get('confidence', {}).get('date') for row in reverse_rows):
+        return None
+    dates = []
+    for row in reverse_rows:
+        raw = str(row.get('date') or '').strip()
+        parsed = None
+        for fmt in ('%d.%m.%Y', '%d.%m.%y', '%d.%m'):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                parsed = (dt.day, dt.month, dt.year if fmt != '%d.%m' else None)
+                break
+            except ValueError:
+                pass
+        if parsed is None:
+            return None
+        dates.append(parsed)
+    matches = []
+    for group in groups:
+        selected = []
+        for day, month, year in dates:
+            found = []
+            for record in group:
+                try:
+                    dt = datetime.fromisoformat(str(record.get('Дата') or ''))
+                except ValueError:
+                    continue
+                if (dt.day, dt.month) == (day, month) and (year is None or dt.year == year):
+                    found.append(record)
+            if len(found) != 1:
+                break
+            if found[0] not in selected:
+                selected.append(found[0])
+        else:
+            matches.append(selected)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_order_candidates(w):
+    records = w.get('fields', {}).get('order_candidates')
+    if not records:
+        return
+    selected = _match_scan_dates(_order_groups(records), w.get('reverse_times', []))
+    if selected is not None:
+        w['fields'], w['warning'] = fetch_order_by_pl(w.get('pl_number', ''), records_override=selected)
+        w['order_selection_confirmed'] = True
+        w['warning'] = 'Заказ выбран по уверенно прочитанным датам оборота. ' + (w['warning'] or '')
+
+
+def _check_legacy_order_selection(w):
+    if not w.get('pl_number') or w.get('fields', {}).get('api_selection_version') == 1:
+        return False
+    fresh, warning = fetch_order_by_pl(w['pl_number'])
+    if fresh.get('order_candidates'):
+        w['fields'], w['warning'] = fresh, warning
+        _resolve_order_candidates(w)
+        _apply_reverse_times(w)
+        _save_state()
+        return True
+    w.setdefault('fields', {})['api_selection_version'] = 1
+    return False
+
+
+def fetch_order_by_pl(pl_number: str, records_override=None) -> tuple[dict, Optional[str]]:
     """
     Получить данные смены/заказа из 1С по штрихкоду путевого листа
     (working_shift_barcode). Возвращает (fields, warning):
@@ -368,13 +441,17 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
     """
     url = f"{API_BASE}/working_shift_barcode"
     payload = {"ШК": pl_number}
-    resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=30)
-    if resp.status_code == 405:
-        resp = requests.get(url, params=payload, headers=_auth_headers(), timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
+    if records_override is None:
+        resp = requests.post(url, json=payload, headers=_auth_headers(), timeout=30)
+        if resp.status_code == 405:
+            resp = requests.get(url, params=payload, headers=_auth_headers(), timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    else:
+        data = records_override
 
     fields = _empty_fields()
+    fields['api_selection_version'] = 1
 
     # 1С отвечает объектом {"status":"error","info":"..."} вместо пустого
     # списка, когда заказ/смена по ШК не найдены — это не HTTP-ошибка (200 OK).
@@ -387,6 +464,9 @@ def fetch_order_by_pl(pl_number: str) -> tuple[dict, Optional[str]]:
     if not records:
         return fields, f"Заказ по штрихкоду {pl_number} не найден в 1С — заполните поля вручную"
 
+    if len(_order_groups(records)) > 1:
+        fields['order_candidates'] = records
+        return fields, 'По штрихкоду найдены разные заказы или машины. Требуется сопоставление с датами скана либо выбор заказа.'
     records = sorted(records, key=lambda record: str(record.get('Дата') or ''))
     warning = None
     if len(records) > 1:
@@ -1556,6 +1636,7 @@ def _handle_unique_scan(file_path: str, digest: str, batch_id=None):
                         entry['fields'] = _empty_fields()
             _save_state()
     with _state_lock:
+        _resolve_order_candidates(entry)
         _apply_reverse_times(entry)
         entry['processing_seconds'] = round(time.monotonic() - started, 1)
     log.info('Scan %s ready in %.1f sec', job_id, entry['processing_seconds'])
@@ -1809,7 +1890,7 @@ async def waybill_page(job_id: str):
     fields = w.setdefault("fields", {})
     if w.get('processing'):
         return HTMLResponse('<meta http-equiv="refresh" content="3"><p>Скан обрабатывается. Эта страница обновится автоматически.</p>')
-    if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1 or fields.get('api_company_version') != 1) and w.get("pl_number"):
+    if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1 or fields.get('api_company_version') != 1 or fields.get('api_selection_version') != 1) and not w.get('order_selection_confirmed') and not fields.get('order_candidates') and w.get("pl_number"):
         try:
             await refresh_requisites(job_id)
         except HTTPException as exc:
@@ -2163,12 +2244,36 @@ async def read_reverse(job_id: str):
         raise HTTPException(status_code=404)
     try:
         w['reverse_times'] = read_reverse_times(w['file_path'])
+        _resolve_order_candidates(w)
         _apply_reverse_times(w)
         w.pop('reverse_warning', None)
     except Exception:
         raise HTTPException(status_code=502, detail='Не удалось прочитать оборот; повторите позже.')
     _save_state()
     return {'ok': True}
+
+
+@app.post('/select-order/{job_id}')
+async def select_order(job_id: str, request: Request):
+    w = waybills.get(job_id)
+    if not w:
+        raise HTTPException(status_code=404)
+    if w.get('processing'):
+        raise HTTPException(status_code=409, detail='Дождитесь завершения обработки')
+    groups = _order_groups(w.get('fields', {}).get('order_candidates', []))
+    form = await request.form()
+    try:
+        index = int(form.get('order_index', '-1'))
+        if index < 0 or index >= len(groups):
+            raise ValueError()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail='Выберите заказ из списка')
+    fresh, warning = fetch_order_by_pl(w.get('pl_number', ''), records_override=groups[index])
+    w['fields'], w['warning'] = fresh, warning
+    w['order_selection_confirmed'] = True
+    _apply_reverse_times(w)
+    _save_state()
+    return RedirectResponse('/waybill/' + job_id, status_code=303)
 
 
 @app.post("/refresh-requisites/{job_id}")
@@ -2182,9 +2287,17 @@ async def refresh_requisites(job_id: str):
         fresh, warning = fetch_order_by_pl(w["pl_number"])
     except (requests.RequestException, ValueError):
         raise HTTPException(status_code=502, detail="Не удалось получить реквизиты из 1С")
+    if fresh.get('order_candidates'):
+        w.pop('order_selection_confirmed', None)
+        w['fields'], w['warning'] = fresh, warning
+        _resolve_order_candidates(w)
+        _apply_reverse_times(w)
+        _save_state()
+        return {'ok': True}
     if not fresh.get("customer_code") and not fresh.get("customer"):
         raise HTTPException(status_code=400, detail=warning or "Заказчик не найден в 1С")
     fields = w.setdefault("fields", {})
+    fields['api_selection_version'] = 1
     for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
         fields[key] = fresh[key]
     _merge_shift_times(fields, fresh.get('api_shift_rows', []))
@@ -2234,6 +2347,13 @@ async def batch_print(request: Request):
         w = waybills.get(job_id)
         if not w:
             return problem('Путевой не найден', status=404)
+        try:
+            if _check_legacy_order_selection(w):
+                return problem('Обнаружены разные заказы по штрихкоду. Откройте документ и проверьте выбор.', job_id)
+        except (requests.RequestException, ValueError):
+            return problem('Не удалось проверить привязку старого документа в 1С. Повторите позже.', job_id)
+        if w.get('fields', {}).get('order_candidates'):
+            return problem('Выберите заказ для документа: ' + w.get('file_name', job_id), job_id)
         if w.get('processing') or w.get('detection_warning') or any(type(w.get('filled_on_scan', {}).get(k)) is not bool for k in SCAN_FIELDS):
             return problem(f'Анализ документа {w.get("file_name", job_id)} ещё не завершён или завершился с ошибкой. Откройте документ и проверьте сообщение.', job_id)
         selected.append(w)
@@ -2272,6 +2392,13 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=404)
 
     form      = await request.form()
+    try:
+        if _check_legacy_order_selection(w):
+            raise HTTPException(status_code=409, detail='Обнаружены разные заказы по штрихкоду. Обновите страницу и проверьте выбор заказа.')
+    except (requests.RequestException, ValueError):
+        raise HTTPException(status_code=502, detail='Не удалось проверить привязку документа в 1С. Повторите позже.')
+    if w.get('fields', {}).get('order_candidates'):
+        raise HTTPException(status_code=400, detail='По штрихкоду найдены разные заказы. Сначала выберите нужный заказ в карточке.')
     if w.get('processing') or w.get("detection_warning") or any(
         type(w.get("filled_on_scan", {}).get(field)) is not bool for field in SCAN_FIELDS
     ):
@@ -2803,6 +2930,23 @@ def _render_waybill(w: dict) -> str:
     if w.get("error"):
         err_block = f'<div style="background:#fde;border:1px solid #c00;border-radius:4px;padding:8px;margin-bottom:10px;font-size:13px">⚠ {w["error"]}</div>'
 
+    selection_block = ''
+    if f.get('order_candidates'):
+        options = []
+        for index, group in enumerate(_order_groups(f['order_candidates'])):
+            rec = group[0]
+            dates = ', '.join(sorted({str(row.get('Дата', ''))[:10] for row in group}))
+            caption = f"Заказ {rec.get('НомерЗаказа', '')} · {rec.get('КлиентНаименование', '')} · {rec.get('МашинаНаименование', '')} · {dates}"
+            options.append(f'<option value="{index}">{html.escape(caption)}</option>')
+        selection_block = (
+            '<div style="background:#fff3cd;padding:14px;border:2px solid #d99b00;margin:12px 0">'
+            '<b>Нужно выбрать заказ</b><p>Один штрихкод связан с разными заказами или машинами. '
+            'По датам оборота однозначный выбор не получился. Сверьте даты и технику на скане. '
+            'Печать недоступна до выбора. Выбор заново заполнит поля из 1С.</p>'
+            f'<form method="post" action="/select-order/{w["id"]}">'
+            '<select name="order_index" required style="width:100%;padding:10px">'
+            '<option value="" selected disabled>Выберите подходящий заказ и машину</option>'
+            + ''.join(options) + '</select><button type="submit" style="margin-top:10px;padding:10px">Использовать выбранный заказ</button></form></div>')
     warn_block = ""
     if w.get("warning"):
         warn_block = (
@@ -2938,6 +3082,7 @@ body{{margin:0;font-family:Arial,sans-serif;background:#f0f2f5}}
     {err_block}
     {detection_warn_block}
     {warn_block}
+    {selection_block}
     {order_info}
     <div class="legend">
       <span class="dot" style="background:#6c757d"></span>&nbsp;есть на скане &nbsp;
