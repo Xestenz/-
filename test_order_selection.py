@@ -17,6 +17,26 @@ def date(value, confident=True):
 
 
 class OrderSelectionTests(unittest.TestCase):
+    def test_can_switch_back_after_automatic_selection(self):
+        fields, _ = app.fetch_order_by_pl('test', records_override=records())
+        w = {'id': 'test', 'fields': fields, 'reverse_times': [date('05.10')], 'pl_number': 'test'}
+        app._resolve_order_candidates(w)
+        self.assertEqual(len(w['fields']['api_records']), 2)
+        request = Mock()
+        request.form = AsyncMock(return_value={'order_index': '0'})
+        with patch.object(app, 'waybills', {'test': w}), patch.object(app, '_save_state'), patch.object(app, '_apply_reverse_times'):
+            asyncio.run(app.select_order('test', request))
+            self.assertEqual(w['fields']['order_number'], '000009127')
+            request.form = AsyncMock(return_value={'order_index': '1'})
+            asyncio.run(app.select_order('test', request))
+        self.assertEqual(w['fields']['order_number'], '000009183')
+        self.assertEqual(len(w['fields']['api_records']), 2)
+
+    def test_same_order_multiple_days_can_be_selected_separately(self):
+        rows = [records()[1], {**records()[1], 'Дата': '2026-10-06T00:00:00'}]
+        options = app._selection_options(rows)
+        self.assertEqual(options, [rows, [rows[0]], [rows[1]]])
+
     def test_legacy_wrong_order_requires_review_before_print(self):
         fresh, warning = app.fetch_order_by_pl('test', records_override=records())
         w = {'pl_number': 'test', 'fields': {'customer': 'Old wrong customer'}}

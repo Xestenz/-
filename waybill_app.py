@@ -366,6 +366,14 @@ def _order_groups(records):
     return list(groups.values())
 
 
+def _selection_options(records, selected=None):
+    groups = _order_groups(records)
+    options = groups + [[row] for group in groups if len(group) > 1 for row in group]
+    if selected and selected not in options and all(row in records for row in selected) and len(_order_groups(selected)) == 1:
+        options.append(selected)
+    return options
+
+
 def _match_scan_dates(groups, reverse_rows):
     # No partial matching: every detected row must have a confident date.
     if not reverse_rows or any(not row.get('confidence', {}).get('date') for row in reverse_rows):
@@ -412,6 +420,7 @@ def _resolve_order_candidates(w):
     selected = _match_scan_dates(_order_groups(records), w.get('reverse_times', []))
     if selected is not None:
         w['fields'], w['warning'] = fetch_order_by_pl(w.get('pl_number', ''), records_override=selected)
+        w['fields']['api_records'] = records
         w['order_selection_confirmed'] = True
         w['warning'] = 'Заказ выбран по уверенно прочитанным датам оборота. ' + (w['warning'] or '')
 
@@ -460,6 +469,8 @@ def fetch_order_by_pl(pl_number: str, records_override=None) -> tuple[dict, Opti
         return fields, f"{info} — заполните поля вручную"
 
     records = data if isinstance(data, list) else ([data] if data else [])
+    fields['api_records'] = records
+    fields['selected_records'] = records
 
     if not records:
         return fields, f"Заказ по штрихкоду {pl_number} не найден в 1С — заполните поля вручную"
@@ -1890,6 +1901,13 @@ async def waybill_page(job_id: str):
     fields = w.setdefault("fields", {})
     if w.get('processing'):
         return HTMLResponse('<meta http-equiv="refresh" content="3"><p>Скан обрабатывается. Эта страница обновится автоматически.</p>')
+    if 'api_records' not in fields and w.get('order_selection_confirmed') and w.get('pl_number'):
+        fresh, _ = fetch_order_by_pl(w['pl_number'])
+        fields['api_records'] = fresh.get('api_records', [])
+        fields['selected_records'] = [row for row in fields['api_records']
+            if row.get('НомерЗаказа') == fields.get('order_number')
+            and row.get('МашинаНаименование') == fields.get('vehicle_type')]
+        _save_state()
     if (not fields.get("customer_details_loaded") or fields.get('api_time_version') != 1 or fields.get('api_company_version') != 1 or fields.get('api_selection_version') != 1) and not w.get('order_selection_confirmed') and not fields.get('order_candidates') and w.get("pl_number"):
         try:
             await refresh_requisites(job_id)
@@ -2260,7 +2278,8 @@ async def select_order(job_id: str, request: Request):
         raise HTTPException(status_code=404)
     if w.get('processing'):
         raise HTTPException(status_code=409, detail='Дождитесь завершения обработки')
-    groups = _order_groups(w.get('fields', {}).get('order_candidates', []))
+    records = w.get('fields', {}).get('api_records') or w.get('fields', {}).get('order_candidates', [])
+    groups = _selection_options(records, w.get('fields', {}).get('selected_records'))
     form = await request.form()
     try:
         index = int(form.get('order_index', '-1'))
@@ -2269,6 +2288,7 @@ async def select_order(job_id: str, request: Request):
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail='Выберите заказ из списка')
     fresh, warning = fetch_order_by_pl(w.get('pl_number', ''), records_override=groups[index])
+    fresh['api_records'] = records
     w['fields'], w['warning'] = fresh, warning
     w['order_selection_confirmed'] = True
     _apply_reverse_times(w)
@@ -2298,6 +2318,8 @@ async def refresh_requisites(job_id: str):
         raise HTTPException(status_code=400, detail=warning or "Заказчик не найден в 1С")
     fields = w.setdefault("fields", {})
     fields['api_selection_version'] = 1
+    fields['api_records'] = fresh.get('api_records', [])
+    fields['selected_records'] = fresh.get('selected_records', [])
     for key in ("customer", "customer_short_name", "customer_code", "customer_details_loaded"):
         fields[key] = fresh[key]
     _merge_shift_times(fields, fresh.get('api_shift_rows', []))
@@ -2931,21 +2953,24 @@ def _render_waybill(w: dict) -> str:
         err_block = f'<div style="background:#fde;border:1px solid #c00;border-radius:4px;padding:8px;margin-bottom:10px;font-size:13px">⚠ {w["error"]}</div>'
 
     selection_block = ''
-    if f.get('order_candidates'):
+    selection_records = f.get('api_records') or f.get('order_candidates', [])
+    if len(selection_records) > 1:
         options = []
-        for index, group in enumerate(_order_groups(f['order_candidates'])):
+        for index, group in enumerate(_selection_options(selection_records, f.get('selected_records'))):
             rec = group[0]
             dates = ', '.join(sorted({str(row.get('Дата', ''))[:10] for row in group}))
             caption = f"Заказ {rec.get('НомерЗаказа', '')} · {rec.get('КлиентНаименование', '')} · {rec.get('МашинаНаименование', '')} · {dates}"
-            options.append(f'<option value="{index}">{html.escape(caption)}</option>')
+            caption = ('Смены: ' if len(group) > 1 else 'Смена: ') + caption
+            active = not f.get('order_candidates') and group == f.get('selected_records')
+            options.append(f'<option value="{index}"' + (' selected' if active else '') + f'>{html.escape(caption)}</option>')
         selection_block = (
             '<div style="background:#fff3cd;padding:14px;border:2px solid #d99b00;margin:12px 0">'
-            '<b>Нужно выбрать заказ</b><p>Один штрихкод связан с разными заказами или машинами. '
-            'По датам оборота однозначный выбор не получился. Сверьте даты и технику на скане. '
-            'Печать недоступна до выбора. Выбор заново заполнит поля из 1С.</p>'
+            '<b>Данные из 1С — выбор заказа и смены</b><p>Можно выбрать все смены одного заказа '
+            'или отдельную запись, затем переключиться на другую. Выбор заново заполнит поля из 1С; '
+            'несохранённые правки будут потеряны.</p>'
             f'<form method="post" action="/select-order/{w["id"]}">'
             '<select name="order_index" required style="width:100%;padding:10px">'
-            '<option value="" selected disabled>Выберите подходящий заказ и машину</option>'
+            '<option value=""' + (' selected' if f.get('order_candidates') else '') + ' disabled>Выберите подходящий заказ и машину</option>'
             + ''.join(options) + '</select><button type="submit" style="margin-top:10px;padding:10px">Использовать выбранный заказ</button></form></div>')
     warn_block = ""
     if w.get("warning"):
