@@ -2245,7 +2245,9 @@ async def batch_print(request: Request):
                 for w in selected:
                     _prepare_source(w)
                     data = marked_pdf(fill_scan_pdf(w['file_path'], w['fields'], w['filled_on_scan'], additions_only=mode == 'additions'))
-                    w['saved_paths'] = _save_completed(w, data, _pdf_filename(_default_pdf_name(w)))
+                    archive_data = data if mode == 'copy' else marked_pdf(fill_scan_pdf(
+                        w['file_path'], w['fields'], w['filled_on_scan'], additions_only=False))
+                    w['saved_paths'] = _save_completed(w, archive_data, _pdf_filename(_default_pdf_name(w)))
                     w.pop('save_error', None)
                     w['status'] = 'confirmed'
                     bookmarks.append([1, str(w.get('pl_number') or w.get('file_name') or w['id']), len(combined) + 1])
@@ -2334,9 +2336,11 @@ async def print_waybill(job_id: str, request: Request):
         raise HTTPException(status_code=500, detail=str(exc))
 
     try:
-        # Archive exactly the selected output: additions by default, copy only explicitly.
+        # Working folders always receive the complete document; print mode only
+        # controls the PDF returned to the browser.
         with _pdf_lock:
-            archived_pdf = marked_pdf(pdf_bytes)
+            archived_pdf = marked_pdf(pdf_bytes if print_mode == 'copy' else fill_scan_pdf(
+                scan_path, fields, filled_on_scan, additions_only=False))
         w['saved_paths'] = _save_completed(w, archived_pdf, _pdf_filename(_default_pdf_name(w)))
         w.pop('save_error', None)
     except Exception as exc:
@@ -2781,7 +2785,7 @@ def _render_waybill(w: dict) -> str:
     <button type="button" onclick="printWaybill('additions', this, 'group')"
       style="width:100%;padding:14px;background:#2980b9;color:white;border:0;border-radius:6px;font-size:16px;cursor:pointer;margin-top:8px">Допечатать всю группу на оригиналах</button>
     <p style="font-size:12px">Разложите оригиналы по номеру путевого, затем по имени файла. В PDF — одна лицевая сторона на путевой, включая пустые страницы без дополнений. Печатайте односторонне, масштаб 100%. Порядок виден в закладках PDF.</p>
-    <p style="font-size:12px;color:#666">Все действия сохраняют PDF в рабочие папки. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
+    <p style="font-size:12px;color:#666">В рабочие папки всегда сохраняется полный скан с дополнениями и оборотом. PDF для допечатки содержит только новые надписи. Группа — файлы одной загрузки; для папки сканера — поступившие с паузами не более двух минут. Сначала сохраните правки в других вкладках.</p>
     <details style="margin-top:12px"><summary>Скачать PDF</summary><p style="font-size:13px;line-height:1.5">Копию со сканом печатайте на чистом листе.
       <button type="button" onclick="printWaybill('copy', this, 'group')">Полные копии всей группы</button>
       Кнопка «Допечатать на оригинале» создаёт PDF только с новыми надписями.

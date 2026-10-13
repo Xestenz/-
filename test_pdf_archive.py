@@ -11,6 +11,30 @@ import waybill_app as app
 
 
 class ArchiveTests(unittest.TestCase):
+    def test_single_additions_returns_overlay_but_archives_both_original_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'source.pdf'
+            with fitz.open() as doc:
+                doc.new_page(width=842, height=595).insert_text((30, 30), 'FRONT ORIGINAL')
+                doc.new_page(width=842, height=595).insert_text((30, 30), 'REVERSE ORIGINAL')
+                doc.save(source)
+            entry = {'id': 'single', 'file_path': str(source), 'fields': {},
+                     'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False)}
+            request = Mock()
+            request.form = AsyncMock(return_value=FormData({'print_mode': 'additions', 'time_out_1': '09:00'}))
+            with patch.object(app, 'waybills', {'single': entry}), patch.object(app, '_save_state'), \
+                    patch.object(app, '_auto_calibrate'), patch.object(app, '_save_completed', return_value=[]) as save:
+                response = asyncio.run(app.print_waybill('single', request))
+            with fitz.open(stream=response.body, filetype='pdf') as doc:
+                self.assertEqual(len(doc), 1)
+                self.assertNotIn('FRONT ORIGINAL', doc[0].get_text())
+                self.assertIn('09:00', doc[0].get_text())
+            with fitz.open(stream=save.call_args.args[1], filetype='pdf') as doc:
+                self.assertEqual(len(doc), 2)
+                self.assertIn('FRONT ORIGINAL', doc[0].get_text())
+                self.assertIn('09:00', doc[0].get_text())
+                self.assertIn('REVERSE ORIGINAL', doc[1].get_text())
+
     def test_manual_upload_replaces_matching_inbox_original(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -39,7 +63,7 @@ class ArchiveTests(unittest.TestCase):
             self.assertFalse(entry.get('replace_source', False))
             self.assertEqual(source.read_bytes(), b'new scan')
 
-    def test_additions_batch_archives_only_additions(self):
+    def test_additions_batch_archives_full_documents(self):
         entries = {key: {'id': key, 'file_name': key, 'pl_number': number,
             'file_path': str(app.TEMPLATE_PATH), 'fields': {'work_date': '07.10.2026', 'time_out_1': '09:00'},
             'filled_on_scan': dict.fromkeys(app.SCAN_FIELDS, False)}
@@ -55,8 +79,11 @@ class ArchiveTests(unittest.TestCase):
             self.assertFalse(doc[0].get_images())
         for call in save.call_args_list:
             with fitz.open(stream=call.args[1], filetype='pdf') as archived:
-                self.assertEqual(len(archived), 1)
-                self.assertFalse(archived[0].get_images())
+                with fitz.open(app.TEMPLATE_PATH) as original:
+                    self.assertEqual(len(archived), len(original))
+                    self.assertIn(original[0].get_text().splitlines()[0], archived[0].get_text())
+                    if len(original) > 1:
+                        self.assertEqual(archived[1].get_text(), original[1].get_text())
                 self.assertIn('09:00', archived[0].get_text())
 
     def test_replace_source_after_both_outputs_and_preserve_cache(self):
